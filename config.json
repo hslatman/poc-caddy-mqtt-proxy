@@ -1,0 +1,80 @@
+{
+    "logging": {
+        "logs": {
+            "default": {
+                "level": "DEBUG",
+                "writer": {
+                    "output": "stderr"
+                }
+            }
+        }
+    },
+    "apps": {
+        "layer4": {
+            "servers": {
+                "mqtts": {
+                    "listen": ["localhost:8883"],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "tls": {}
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "handler": "tls"
+                                },
+                                {
+                                    "handler": "proxy",
+                                    "upstreams": [
+                                        {
+                                            "dial": ["localhost:1883"]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "wss": {
+                    "listen": ["localhost:8443"],
+                    "routes": [
+                        {
+                            "match": [
+                                {
+                                    "tls": {}
+                                }
+                            ],
+                            "handle": [
+                                {
+                                    "handler": "tls"
+                                },
+                                {
+                                    "handler": "proxy",
+                                    "upstreams": [
+                                        {
+                                            "dial": ["localhost:9001"]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        "tls": {
+            "certificates": {
+                "automate": ["localhost"]
+            },
+            "automation": {
+                "policies": [{
+                    "issuer": {
+                        "module": "internal"
+                    }
+                }]
+            }
+        }
+    }
+}
