@@ -13,7 +13,7 @@ The `wss` endpoint can be reached at `https://localhost:8443` and forwarded to M
 
 Currently no matching is done, apart from matching on a valid TLS handshake, meaning that any TCP traffic (wrapped in TLS) to port 8883 or 8443 will thus be forwarded to Mosquitto.
 
-## Enforcing MQTT Traffic
+## Enforcing MQTT Traffic via TLS
 
 This repository also contains a custom Caddy Handler that terminates connections that don't look like MQTT.
 Ideally this would have been a Matcher, but when matching an MQTT connection wrapped with TLS, it is not possible to inspect the contents without terminating the TLS connection first, which is done in the TLS Handler.
@@ -22,6 +22,7 @@ In `config.json` an example usage of the MQTT Handler is shown.
 
 ## TODO
 
+* Test plain MQTT connection matching
 * Add some type of (G)UI for visualizing MQTT communication
 * Implement a handler that matches MQTT over WebSocket traffic?
 * Implement an MQTTS matcher (like, TLS + MQTT wrapped; easier configuration)?

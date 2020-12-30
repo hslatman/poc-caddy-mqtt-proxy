@@ -15,14 +15,11 @@
 package handlers
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/binary"
-	"encoding/hex"
 	"fmt"
-	"net"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/hslatman/poc-caddy-mqtt-proxy/internal/conn"
+	"github.com/hslatman/poc-caddy-mqtt-proxy/pkg/matchers"
 	"github.com/mholt/caddy-l4/layer4"
 	"go.uber.org/zap"
 )
@@ -56,9 +53,11 @@ func (m *MQTT) Provision(ctx caddy.Context) error {
 // Handle handles the downstream connection.
 func (m *MQTT) Handle(cx *layer4.Connection, next layer4.Handler) error {
 
-	wrappedConnection := wrap(cx.Conn)
+	matcher := &matchers.MatchMQTT{}
 
-	isValidMQTTConnection, err := checkConnection(wrappedConnection)
+	wrappedConnection := conn.NewBufferedConn(cx.Conn)
+
+	isValidMQTTConnection, err := matcher.CheckBufferedConnection(wrappedConnection)
 	if err != nil {
 		m.logger.Error(err.Error())
 	}
@@ -74,93 +73,6 @@ func (m *MQTT) Handle(cx *layer4.Connection, next layer4.Handler) error {
 	cx.Conn = wrappedConnection
 
 	return next.Handle(cx)
-}
-
-var mqttProtocolName = append([]byte{0x00, 0x04}, []byte("MQTT")...) // https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718029
-
-var mqttRevisions = map[byte]string{
-	// 1: "",
-	// 2: "",
-	3: "3.1", // and 3.0, according to https://public.dhe.ibm.com/software/dw/webservices/ws-mqtt/mqtt-v3r1.html?
-	4: "3.1.1",
-	5: "5",
-}
-
-type bufferedConn struct {
-	// implementation based on answer from
-	// https://stackoverflow.com/questions/26196813/peek-into-conn-without-reading-in-go
-	r *bufio.Reader
-	net.Conn
-}
-
-func wrap(c net.Conn) bufferedConn {
-	return bufferedConn{bufio.NewReader(c), c}
-}
-
-func (b bufferedConn) Peek(n int) ([]byte, error) {
-	return b.r.Peek(n)
-}
-
-func (b bufferedConn) Read(p []byte) (int, error) {
-	return b.r.Read(p)
-}
-
-func checkConnection(b bufferedConn) (bool, error) {
-
-	var err error
-
-	// The header/length logic below is largely based on the implementation found in github.com/VolantMQ/volantmq
-	// Also see: https://github.com/VolantMQ/volantmq/blob/3e00ff16a9a086c5b40c45edd77fec98ab530bc5/connection/reader.go#L114
-
-	var header []byte
-	peekCount := 2
-	for {
-		if peekCount > 5 {
-			// break out if we try to peek too far for what's allowed in MQTT
-			return false, fmt.Errorf("error in protocol")
-		}
-
-		if header, err = b.Peek(peekCount); err != nil {
-			// break out on error when peeking
-			return false, err
-		}
-
-		// when sufficient bytes have been read, check if we should continue
-		// peeking or have found the correct length of the message
-		if header[peekCount-1] >= 0x80 {
-			peekCount++
-		} else {
-			break
-		}
-	}
-
-	// Get the remaining (and total) length of the message
-	remainingLength, numberOfLengthBytes := binary.Uvarint(header[1:])
-	totalLength := 1 + numberOfLengthBytes + int(remainingLength)
-
-	p, err := b.Peek(totalLength)
-	if err != nil {
-		return false, err
-	}
-
-	// we're expecting an MQTT CONNECT packet
-	if p[0] != 0x10 { // 00010000; also see: https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718029
-		return false, fmt.Errorf("unexpected control packet type: 0x%s", hex.EncodeToString(p[0:1]))
-	}
-
-	if !bytes.Equal(p[2:8], mqttProtocolName) {
-		return false, fmt.Errorf("got wrong protocol name: 0x%s", hex.EncodeToString(p[2:8]))
-	}
-
-	revision := p[8]
-	if _, ok := mqttRevisions[revision]; !ok {
-		return false, fmt.Errorf("got invalid revision: 0x%s", hex.EncodeToString(p[8:9]))
-	}
-
-	// TODO: add some configuration and perform checks based on those?
-	// TODO: do something with the rest of the bytes?
-
-	return true, err
 }
 
 // Interface guards
