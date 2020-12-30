@@ -76,7 +76,7 @@ func (m *MQTT) Handle(cx *layer4.Connection, next layer4.Handler) error {
 	return next.Handle(cx)
 }
 
-var mqttPrefix = append([]byte{0x00, 0x04}, []byte("MQTT")...) // https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718029
+var mqttProtocolName = append([]byte{0x00, 0x04}, []byte("MQTT")...) // https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718029
 
 var mqttRevisions = map[byte]string{
 	// 1: "",
@@ -148,7 +148,7 @@ func checkConnection(b bufferedConn) (bool, error) {
 		return false, fmt.Errorf("unexpected control packet type: 0x%s", hex.EncodeToString(p[0:1]))
 	}
 
-	if !bytes.Equal(p[2:8], mqttPrefix) {
+	if !bytes.Equal(p[2:8], mqttProtocolName) {
 		return false, fmt.Errorf("got wrong protocol name: 0x%s", hex.EncodeToString(p[2:8]))
 	}
 
