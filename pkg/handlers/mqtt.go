@@ -66,10 +66,7 @@ func (m *MQTT) Handle(cx *layer4.Connection, next layer4.Handler) error {
 	// terminate the connection if it could not be determined to be MQTT
 	if !isValidMQTTConnection {
 		m.logger.Debug(fmt.Sprintf("terminating connection from %s", cx.Conn.RemoteAddr().String()))
-		err := cx.Conn.Close()
-		if err != nil {
-			return err
-		}
+		return cx.Conn.Close()
 	}
 
 	m.logger.Debug(fmt.Sprintf("accepted connection from %s", cx.Conn.RemoteAddr().String()))
