@@ -26,6 +26,9 @@
                                     "handler": "tls"
                                 },
                                 {
+                                    "handler": "mqtt"
+                                },
+                                {
                                     "handler": "proxy",
                                     "upstreams": [
                                         {

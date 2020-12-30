@@ -12,20 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package conn
 
 import (
-	cmd "github.com/caddyserver/caddy/v2/cmd"
-
-	_ "github.com/caddyserver/caddy/v2/modules/standard"
-	//_ "github.com/caddyserver/format-encoder"
-
-	_ "github.com/mholt/caddy-l4"
-
-	_ "github.com/hslatman/poc-caddy-mqtt-proxy/pkg/handlers"
-	_ "github.com/hslatman/poc-caddy-mqtt-proxy/pkg/matchers"
+	"bufio"
+	"net"
 )
 
-func main() {
-	cmd.Main()
+type BufferedConn struct {
+	// implementation based on answer from
+	// https://stackoverflow.com/questions/26196813/peek-into-conn-without-reading-in-go
+	r *bufio.Reader
+	net.Conn
+}
+
+func NewBufferedConn(c net.Conn) BufferedConn {
+	return BufferedConn{bufio.NewReader(c), c}
+}
+
+func (b BufferedConn) Peek(n int) ([]byte, error) {
+	return b.r.Peek(n)
+}
+
+func (b BufferedConn) Read(p []byte) (int, error) {
+	return b.r.Read(p)
 }
