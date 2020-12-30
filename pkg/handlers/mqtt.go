@@ -56,28 +56,30 @@ func (m *MQTT) Provision(ctx caddy.Context) error {
 // Handle handles the downstream connection.
 func (m *MQTT) Handle(cx *layer4.Connection, next layer4.Handler) error {
 
-	fmt.Println(cx)
-	fmt.Println(next)
+	wrappedConnection := wrap(cx.Conn)
 
-	b := newBufferedConn(cx.Conn)
-
-	isValidMQTTConnection, err := checkConnection(b)
+	isValidMQTTConnection, err := checkConnection(wrappedConnection)
 	if err != nil {
-		m.logger.Warn(err.Error())
+		m.logger.Error(err.Error())
 	}
 
+	// terminate the connection if it could not be determined to be MQTT
 	if !isValidMQTTConnection {
-		// TODO: terminate connection if not MQTT?
+		m.logger.Debug(fmt.Sprintf("terminating connection from %s", cx.Conn.RemoteAddr().String()))
+		err := cx.Conn.Close()
+		if err != nil {
+			return err
+		}
 	}
 
-	m.logger.Debug(fmt.Sprintf("%t", isValidMQTTConnection))
+	m.logger.Debug(fmt.Sprintf("accepted connection from %s", cx.Conn.RemoteAddr().String()))
 
-	cx.Conn = b
+	cx.Conn = wrappedConnection
 
 	return next.Handle(cx)
 }
 
-var mqttPrefix = []byte{0, 4, 77, 81, 84, 84} // TODO: make this more descriptive
+var mqttPrefix = append([]byte{0x00, 0x04}, []byte("MQTT")...) // https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718029
 
 var mqttRevisions = map[byte]string{
 	// 1: "",
@@ -88,16 +90,14 @@ var mqttRevisions = map[byte]string{
 }
 
 type bufferedConn struct {
-	r        *bufio.Reader
-	net.Conn // So that most methods are embedded
+	// implementation based on answer from
+	// https://stackoverflow.com/questions/26196813/peek-into-conn-without-reading-in-go
+	r *bufio.Reader
+	net.Conn
 }
 
-func newBufferedConn(c net.Conn) bufferedConn {
+func wrap(c net.Conn) bufferedConn {
 	return bufferedConn{bufio.NewReader(c), c}
-}
-
-func newBufferedConnSize(c net.Conn, n int) bufferedConn {
-	return bufferedConn{bufio.NewReaderSize(c, n), c}
 }
 
 func (b bufferedConn) Peek(n int) ([]byte, error) {
@@ -112,7 +112,7 @@ func checkConnection(b bufferedConn) (bool, error) {
 
 	var err error
 
-	// The logic below is largely based on the implementation found in github.com/VolantMQ/volantmq
+	// The header/length logic below is largely based on the implementation found in github.com/VolantMQ/volantmq
 	// Also see: https://github.com/VolantMQ/volantmq/blob/3e00ff16a9a086c5b40c45edd77fec98ab530bc5/connection/reader.go#L114
 
 	var header []byte
@@ -137,8 +137,6 @@ func checkConnection(b bufferedConn) (bool, error) {
 		}
 	}
 
-	fmt.Println(header)
-
 	// Get the remaining (and total) length of the message
 	remainingLength, numberOfLengthBytes := binary.Uvarint(header[1:])
 	totalLength := 1 + numberOfLengthBytes + int(remainingLength)
@@ -148,9 +146,7 @@ func checkConnection(b bufferedConn) (bool, error) {
 		return false, err
 	}
 
-	fmt.Println(p)
-
-	// we're expecting a CONNECT
+	// we're expecting an MQTT CONNECT packet
 	if p[0] != 0x10 { // 00010000; also see: https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718029
 		return false, fmt.Errorf("unexpected control packet type: 0x%s", hex.EncodeToString(p[0:1]))
 	}
@@ -165,7 +161,7 @@ func checkConnection(b bufferedConn) (bool, error) {
 	}
 
 	// TODO: add some configuration and perform checks based on those?
-	// TODO: do some stuff with the rest of the bytes?
+	// TODO: do something with the rest of the bytes?
 
 	return true, err
 }
