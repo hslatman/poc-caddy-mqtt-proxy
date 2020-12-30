@@ -6,6 +6,8 @@ services:
     container_name: broker
     image: eclipse-mosquitto
     restart: always
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
     ports:
       - "1883:1883"
       - "9001:9001"
