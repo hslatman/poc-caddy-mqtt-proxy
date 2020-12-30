@@ -22,3 +22,4 @@ Currently no matching is done, apart from matching on a valid TLS handshake, mea
 * Improve README.md
 * Add stats/metrics (i.e. MQTT specific metrics? Bit of a stretch, though)
 * Do stuff with client certificates (mTLS)
+* Do something with ALPN support?
