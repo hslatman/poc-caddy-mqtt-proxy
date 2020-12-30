@@ -21,6 +21,9 @@ import (
 	//_ "github.com/caddyserver/format-encoder"
 
 	_ "github.com/mholt/caddy-l4"
+
+	_ "github.com/hslatman/poc-caddy-mqtt-proxy/pkg/handlers"
+	_ "github.com/hslatman/poc-caddy-mqtt-proxy/pkg/matchers"
 )
 
 func main() {
