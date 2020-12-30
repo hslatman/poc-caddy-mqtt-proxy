@@ -22,7 +22,7 @@ import (
 	"fmt"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/hslatman/poc-caddy-mqtt-proxy/pkg/conn"
+	"github.com/hslatman/poc-caddy-mqtt-proxy/internal/conn"
 	"github.com/mholt/caddy-l4/layer4"
 	"go.uber.org/zap"
 )
