@@ -31,6 +31,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/encode"
 	"go.uber.org/zap"
 )
 
@@ -74,10 +75,26 @@ type FileServer struct {
 	// remove trailing slash from URIs for files. Default is true.
 	CanonicalURIs *bool `json:"canonical_uris,omitempty"`
 
+	// Override the status code written when successfully serving a file.
+	// Particularly useful when explicitly serving a file as display for
+	// an error, like a 404 page. A placeholder may be used. By default,
+	// the status code will typically be 200, or 206 for partial content.
+	StatusCode caddyhttp.WeakString `json:"status_code,omitempty"`
+
 	// If pass-thru mode is enabled and a requested file is not found,
 	// it will invoke the next handler in the chain instead of returning
 	// a 404 error. By default, this is false (disabled).
 	PassThru bool `json:"pass_thru,omitempty"`
+
+	// Selection of encoders to use to check for precompressed files.
+	PrecompressedRaw caddy.ModuleMap `json:"precompressed,omitempty" caddy:"namespace=http.precompressed"`
+
+	// If the client has no strong preference (q-factor), choose these encodings in order.
+	// If no order specified here, the first encoding from the Accept-Encoding header
+	// that both client and server support is used
+	PrecompressedOrder []string `json:"precompressed_order,omitempty"`
+
+	precompressors map[string]encode.Precompressed
 
 	logger *zap.Logger
 }
@@ -129,6 +146,32 @@ func (fsrv *FileServer) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	mods, err := ctx.LoadModule(fsrv, "PrecompressedRaw")
+	if err != nil {
+		return fmt.Errorf("loading encoder modules: %v", err)
+	}
+	for modName, modIface := range mods.(map[string]interface{}) {
+		p, ok := modIface.(encode.Precompressed)
+		if !ok {
+			return fmt.Errorf("module %s is not precompressor", modName)
+		}
+		ae := p.AcceptEncoding()
+		if ae == "" {
+			return fmt.Errorf("precompressor does not specify an Accept-Encoding value")
+		}
+		suffix := p.Suffix()
+		if suffix == "" {
+			return fmt.Errorf("precompressor does not specify a Suffix value")
+		}
+		if _, ok := fsrv.precompressors[ae]; ok {
+			return fmt.Errorf("precompressor already added: %s", ae)
+		}
+		if fsrv.precompressors == nil {
+			fsrv.precompressors = make(map[string]encode.Precompressed)
+		}
+		fsrv.precompressors[ae] = p
+	}
+
 	return nil
 }
 
@@ -138,12 +181,11 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	filesToHide := fsrv.transformHidePaths(repl)
 
 	root := repl.ReplaceAll(fsrv.Root, ".")
-	suffix := repl.ReplaceAll(r.URL.Path, "")
-	filename := sanitizedPathJoin(root, suffix)
+	filename := sanitizedPathJoin(root, r.URL.Path)
 
 	fsrv.logger.Debug("sanitized path join",
 		zap.String("site_root", root),
-		zap.String("request_path", suffix),
+		zap.String("request_path", r.URL.Path),
 		zap.String("result", filename))
 
 	// get information about the file
@@ -206,8 +248,6 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return fsrv.notFound(w, r, next)
 	}
 
-	// TODO: content negotiation (brotli sidecar files, etc...)
-
 	// one last check to ensure the file isn't hidden (we might
 	// have changed the filename from when we last checked)
 	if fileHidden(filename, filesToHide) {
@@ -231,18 +271,51 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		}
 	}
 
-	fsrv.logger.Debug("opening file", zap.String("filename", filename))
+	var file *os.File
 
-	// open the file
-	file, err := fsrv.openFile(filename, w)
-	if err != nil {
-		if herr, ok := err.(caddyhttp.HandlerError); ok &&
-			herr.StatusCode == http.StatusNotFound {
-			return fsrv.notFound(w, r, next)
+	// check for precompressed files
+	for _, ae := range encode.AcceptedEncodings(r, fsrv.PrecompressedOrder) {
+		precompress, ok := fsrv.precompressors[ae]
+		if !ok {
+			continue
 		}
-		return err // error is already structured
+		compressedFilename := filename + precompress.Suffix()
+		compressedInfo, err := os.Stat(compressedFilename)
+		if err != nil || compressedInfo.IsDir() {
+			fsrv.logger.Debug("precompressed file not accessible", zap.String("filename", compressedFilename), zap.Error(err))
+			continue
+		}
+		fsrv.logger.Debug("opening compressed sidecar file", zap.String("filename", compressedFilename), zap.Error(err))
+		file, err = fsrv.openFile(compressedFilename, w)
+		if err != nil {
+			fsrv.logger.Warn("opening precompressed file failed", zap.String("filename", compressedFilename), zap.Error(err))
+			if caddyErr, ok := err.(caddyhttp.HandlerError); ok && caddyErr.StatusCode == http.StatusServiceUnavailable {
+				return err
+			}
+			continue
+		}
+		defer file.Close()
+		w.Header().Set("Content-Encoding", ae)
+		w.Header().Del("Accept-Ranges")
+		w.Header().Add("Vary", "Accept-Encoding")
+		break
 	}
-	defer file.Close()
+
+	// no precompressed file found, use the actual file
+	if file == nil {
+		fsrv.logger.Debug("opening file", zap.String("filename", filename))
+
+		// open the file
+		file, err = fsrv.openFile(filename, w)
+		if err != nil {
+			if herr, ok := err.(caddyhttp.HandlerError); ok &&
+				herr.StatusCode == http.StatusNotFound {
+				return fsrv.notFound(w, r, next)
+			}
+			return err // error is already structured
+		}
+		defer file.Close()
+	}
 
 	// set the ETag - note that a conditional If-None-Match request is handled
 	// by http.ServeContent below, which checks against this ETag value
@@ -278,6 +351,16 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		return nil
 	}
 
+	// if a status code override is configured, write the status code
+	// before serving the file
+	if codeStr := fsrv.StatusCode.String(); codeStr != "" {
+		intVal, err := strconv.Atoi(repl.ReplaceAll(codeStr, ""))
+		if err != nil {
+			return caddyhttp.Error(http.StatusInternalServerError, err)
+		}
+		w.WriteHeader(intVal)
+	}
+
 	// let the standard library do what it does best; note, however,
 	// that errors generated by ServeContent are written immediately
 	// to the response, so we cannot handle them (but errors there
@@ -296,8 +379,10 @@ func (fsrv *FileServer) openFile(filename string, w http.ResponseWriter) (*os.Fi
 	if err != nil {
 		err = mapDirOpenError(err, filename)
 		if os.IsNotExist(err) {
+			fsrv.logger.Debug("file not found", zap.String("filename", filename), zap.Error(err))
 			return nil, caddyhttp.Error(http.StatusNotFound, err)
 		} else if os.IsPermission(err) {
+			fsrv.logger.Debug("permission denied", zap.String("filename", filename), zap.Error(err))
 			return nil, caddyhttp.Error(http.StatusForbidden, err)
 		}
 		// maybe the server is under load and ran out of file descriptors?
@@ -305,6 +390,7 @@ func (fsrv *FileServer) openFile(filename string, w http.ResponseWriter) (*os.Fi
 		//nolint:gosec
 		backoff := weakrand.Intn(maxBackoff-minBackoff) + minBackoff
 		w.Header().Set("Retry-After", strconv.Itoa(backoff))
+		fsrv.logger.Debug("retry after backoff", zap.String("filename", filename), zap.Int("backoff", backoff), zap.Error(err))
 		return nil, caddyhttp.Error(http.StatusServiceUnavailable, err)
 	}
 	return file, nil

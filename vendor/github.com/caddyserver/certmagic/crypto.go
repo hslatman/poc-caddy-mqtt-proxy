@@ -33,6 +33,7 @@ import (
 
 	"github.com/klauspost/cpuid"
 	"go.uber.org/zap"
+	"golang.org/x/net/idna"
 )
 
 // encodePrivateKey marshals a EC or RSA private key into a PEM-encoded array of bytes.
@@ -231,67 +232,28 @@ func (cfg *Config) loadCertResource(issuer Issuer, certNamesKey string) (Certifi
 	var certRes CertificateResource
 	issuerKey := issuer.IssuerKey()
 
-	certBytes, err := cfg.Storage.Load(StorageKeys.SiteCert(issuerKey, certNamesKey))
+	normalizedName, err := idna.ToASCII(certNamesKey)
+	if err != nil {
+		return certRes, fmt.Errorf("converting '%s' to ASCII: %v", certNamesKey, err)
+	}
+
+	certBytes, err := cfg.Storage.Load(StorageKeys.SiteCert(issuerKey, normalizedName))
 	if err != nil {
 		return CertificateResource{}, err
 	}
 	certRes.CertificatePEM = certBytes
-	keyBytes, err := cfg.Storage.Load(StorageKeys.SitePrivateKey(issuerKey, certNamesKey))
+	keyBytes, err := cfg.Storage.Load(StorageKeys.SitePrivateKey(issuerKey, normalizedName))
 	if err != nil {
 		return CertificateResource{}, err
 	}
 	certRes.PrivateKeyPEM = keyBytes
-	metaBytes, err := cfg.Storage.Load(StorageKeys.SiteMeta(issuerKey, certNamesKey))
+	metaBytes, err := cfg.Storage.Load(StorageKeys.SiteMeta(issuerKey, normalizedName))
 	if err != nil {
 		return CertificateResource{}, err
 	}
 	err = json.Unmarshal(metaBytes, &certRes)
 	if err != nil {
 		return CertificateResource{}, fmt.Errorf("decoding certificate metadata: %v", err)
-	}
-
-	// TODO: July 2020 - transition to new ACME lib and cert resource structure;
-	// for a while, we will need to convert old cert resources to new structure
-	certRes, err = cfg.transitionCertMetaToACMEzJuly2020Format(issuer, certRes, metaBytes)
-	if err != nil {
-		return certRes, fmt.Errorf("one-time certificate resource transition: %v", err)
-	}
-
-	return certRes, nil
-}
-
-// TODO: this is a temporary transition helper starting July 2020.
-// It can go away when we think enough time has passed that most active assets have transitioned.
-func (cfg *Config) transitionCertMetaToACMEzJuly2020Format(issuer Issuer, certRes CertificateResource, metaBytes []byte) (CertificateResource, error) {
-	data, ok := certRes.IssuerData.(map[string]interface{})
-	if !ok {
-		return certRes, nil
-	}
-	if certURL, ok := data["url"].(string); ok && certURL != "" {
-		return certRes, nil
-	}
-
-	var oldCertRes struct {
-		SANs       []string `json:"sans"`
-		IssuerData struct {
-			Domain        string `json:"domain"`
-			CertURL       string `json:"certUrl"`
-			CertStableURL string `json:"certStableUrl"`
-		} `json:"issuer_data"`
-	}
-	err := json.Unmarshal(metaBytes, &oldCertRes)
-	if err != nil {
-		return certRes, fmt.Errorf("decoding into old certificate resource type: %v", err)
-	}
-
-	data = map[string]interface{}{
-		"url": oldCertRes.IssuerData.CertURL,
-	}
-	certRes.IssuerData = data
-
-	err = cfg.saveCertResource(issuer, certRes)
-	if err != nil {
-		return certRes, fmt.Errorf("saving converted certificate resource: %v", err)
 	}
 
 	return certRes, nil

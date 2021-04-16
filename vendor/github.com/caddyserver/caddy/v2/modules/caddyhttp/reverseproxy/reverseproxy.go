@@ -21,9 +21,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -44,7 +44,7 @@ func init() {
 // Handler implements a highly configurable and production-ready reverse proxy.
 //
 // Upon proxying, this module sets the following placeholders (which can be used
-// both within and after this handler):
+// both within and after this handler; for example, in response headers):
 //
 // Placeholder | Description
 // ------------|-------------
@@ -55,6 +55,9 @@ func init() {
 // `{http.reverse_proxy.upstream.requests}` | The approximate current number of requests to the upstream
 // `{http.reverse_proxy.upstream.max_requests}` | The maximum approximate number of requests allowed to the upstream
 // `{http.reverse_proxy.upstream.fails}` | The number of recent failed requests to the upstream
+// `{http.reverse_proxy.upstream.latency}` | How long it took the proxy upstream to write the response header.
+// `{http.reverse_proxy.upstream.duration}` | Time spent proxying to the upstream, including writing response body to client.
+// `{http.reverse_proxy.duration}` | Total time spent proxying, including selecting an upstream, retries, and writing response.
 type Handler struct {
 	// Configures the method of transport for the proxy. A transport
 	// is what performs the actual "round trip" to the backend.
@@ -93,8 +96,19 @@ type Handler struct {
 
 	// If true, the entire request body will be read and buffered
 	// in memory before being proxied to the backend. This should
-	// be avoided if at all possible for performance reasons.
+	// be avoided if at all possible for performance reasons, but
+	// could be useful if the backend is intolerant of read latency.
 	BufferRequests bool `json:"buffer_requests,omitempty"`
+
+	// If true, the entire response body will be read and buffered
+	// in memory before being proxied to the client. This should
+	// be avoided if at all possible for performance reasons, but
+	// could be useful if the backend has tighter memory constraints.
+	BufferResponses bool `json:"buffer_responses,omitempty"`
+
+	// If body buffering is enabled, the maximum size of the buffers
+	// used for the requests and responses (in bytes).
+	MaxBufferSize int64 `json:"max_buffer_size,omitempty"`
 
 	// List of handlers and their associated matchers to evaluate
 	// after successful roundtrips. The first handler that matches
@@ -260,13 +274,28 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 
 		// if active health checks are enabled, configure them and start a worker
-		if h.HealthChecks.Active != nil &&
-			(h.HealthChecks.Active.Path != "" || h.HealthChecks.Active.Port != 0) {
+		if h.HealthChecks.Active != nil && (h.HealthChecks.Active.Path != "" ||
+			h.HealthChecks.Active.URI != "" ||
+			h.HealthChecks.Active.Port != 0) {
+
 			h.HealthChecks.Active.logger = h.logger.Named("health_checker.active")
 
 			timeout := time.Duration(h.HealthChecks.Active.Timeout)
 			if timeout == 0 {
 				timeout = 5 * time.Second
+			}
+
+			if h.HealthChecks.Active.Path != "" {
+				h.HealthChecks.Active.logger.Warn("the 'path' option is deprecated, please use 'uri' instead!")
+			}
+
+			// parse the URI string (supports path and query)
+			if h.HealthChecks.Active.URI != "" {
+				parsedURI, err := url.Parse(h.HealthChecks.Active.URI)
+				if err != nil {
+					return err
+				}
+				h.HealthChecks.Active.uri = parsedURI
 			}
 
 			h.HealthChecks.Active.httpClient = &http.Client{
@@ -337,12 +366,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	// required, if read timeouts are set,
 	// and if body size is limited
 	if h.BufferRequests {
-		buf := bufPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		defer bufPool.Put(buf)
-		_, _ = io.Copy(buf, r.Body)
-		r.Body.Close()
-		r.Body = ioutil.NopCloser(buf)
+		r.Body = h.bufferedBody(r.Body)
 	}
 
 	// prepare the request for proxying; this is needed only once
@@ -360,11 +384,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	reqHost := r.Host
 	reqHeader := r.Header
 	defer func() {
-		r.Host = reqHost
-		r.Header = reqHeader
+		r.Host = reqHost     // TODO: data race, see #4038
+		r.Header = reqHeader // TODO: data race, see #4038
 	}()
 
 	start := time.Now()
+	defer func() {
+		// total proxying duration, including time spent on LB and retries
+		repl.Set("http.reverse_proxy.duration", time.Since(start))
+	}()
 
 	var proxyErr error
 	for {
@@ -414,7 +442,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 
 		// proxy the request to that upstream
-		proxyErr = h.reverseProxy(w, r, dialInfo, next)
+		proxyErr = h.reverseProxy(w, r, repl, dialInfo, next)
 		if proxyErr == nil || proxyErr == context.Canceled {
 			// context.Canceled happens when the downstream client
 			// cancels the request, which is not our failure
@@ -517,7 +545,7 @@ func (h Handler) prepareRequest(req *http.Request) error {
 // reverseProxy performs a round-trip to the given backend and processes the response with the client.
 // (This method is mostly the beginning of what was borrowed from the net/http/httputil package in the
 // Go standard library which was used as the foundation.)
-func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di DialInfo, next caddyhttp.Handler) error {
+func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, repl *caddy.Replacer, di DialInfo, next caddyhttp.Handler) error {
 	_ = di.Upstream.Host.CountRequest(1)
 	//nolint:errcheck
 	defer di.Upstream.Host.CountRequest(-1)
@@ -542,6 +570,9 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 		zap.Object("headers", caddyhttp.LoggableHTTPHeader(res.Header)),
 		zap.Int("status", res.StatusCode))
 
+	// duration until upstream wrote response headers (roundtrip duration)
+	repl.Set("http.reverse_proxy.upstream.latency", duration)
+
 	// update circuit breaker on current conditions
 	if di.Upstream.cb != nil {
 		di.Upstream.cb.RecordMetric(res.StatusCode, duration)
@@ -563,13 +594,16 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 		}
 	}
 
+	// if enabled, buffer the response body
+	if h.BufferResponses {
+		res.Body = h.bufferedBody(res.Body)
+	}
+
 	// see if any response handler is configured for this response from the backend
 	for i, rh := range h.HandleResponse {
 		if rh.Match != nil && !rh.Match.Match(res.StatusCode, res.Header) {
 			continue
 		}
-
-		repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
 		// if configured to only change the status code, do that then continue regular proxy response
 		if statusCodeStr := rh.StatusCode.String(); statusCodeStr != "" {
@@ -599,7 +633,7 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 		}
 	}
 
-	// Deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
+	// deal with 101 Switching Protocols responses: (WebSocket, h2c, etc)
 	if res.StatusCode == http.StatusSwitchingProtocols {
 		h.handleUpgradeResponse(rw, req, res)
 		return nil
@@ -615,7 +649,6 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 	if h.Headers != nil && h.Headers.Response != nil {
 		if h.Headers.Response.Require == nil ||
 			h.Headers.Response.Require.Match(res.StatusCode, res.Header) {
-			repl := req.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 			h.Headers.Response.ApplyTo(res.Header, repl)
 		}
 	}
@@ -662,6 +695,9 @@ func (h *Handler) reverseProxy(rw http.ResponseWriter, req *http.Request, di Dia
 			fl.Flush()
 		}
 	}
+
+	// total duration spent proxying, including writing response body
+	repl.Set("http.reverse_proxy.upstream.duration", duration)
 
 	if len(res.Trailer) == announcedTrailers {
 		copyHeader(rw.Header(), res.Trailer)
@@ -733,6 +769,30 @@ func (h Handler) directRequest(req *http.Request, di DialInfo) {
 	}
 
 	req.URL.Host = reqHost
+}
+
+// bufferedBody reads originalBody into a buffer, then returns a reader for the buffer.
+// Always close the return value when done with it, just like if it was the original body!
+func (h Handler) bufferedBody(originalBody io.ReadCloser) io.ReadCloser {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if h.MaxBufferSize > 0 {
+		n, err := io.CopyN(buf, originalBody, h.MaxBufferSize)
+		if err != nil || n == h.MaxBufferSize {
+			return bodyReadCloser{
+				Reader: io.MultiReader(buf, originalBody),
+				buf:    buf,
+				body:   originalBody,
+			}
+		}
+	} else {
+		_, _ = io.Copy(buf, originalBody)
+	}
+	originalBody.Close() // no point in keeping it open
+	return bodyReadCloser{
+		Reader: buf,
+		buf:    buf,
+	}
 }
 
 func copyHeader(dst, src http.Header) {
@@ -858,6 +918,23 @@ type TLSTransport interface {
 // roundtrip succeeded, but an error occurred after-the-fact.
 type roundtripSucceeded struct{ error }
 
+// bodyReadCloser is a reader that, upon closing, will return
+// its buffer to the pool and close the underlying body reader.
+type bodyReadCloser struct {
+	io.Reader
+	buf  *bytes.Buffer
+	body io.ReadCloser
+}
+
+func (brc bodyReadCloser) Close() error {
+	bufPool.Put(brc.buf)
+	if brc.body != nil {
+		return brc.body.Close()
+	}
+	return nil
+}
+
+// bufPool is used for buffering requests and responses.
 var bufPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)

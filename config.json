@@ -13,7 +13,7 @@
         "layer4": {
             "servers": {
                 "mqtts": {
-                    "listen": ["localhost:8883"],
+                    "listen": ["127.0.0.1:8883"],
                     "routes": [
                         {
                             "match": [
@@ -24,9 +24,6 @@
                             "handle": [
                                 {
                                     "handler": "tls"
-                                },
-                                {
-                                    "handler": "mqtt"
                                 },
                                 {
                                     "handler": "proxy",
@@ -41,7 +38,7 @@
                     ]
                 },
                 "wss": {
-                    "listen": ["localhost:8443"],
+                    "listen": ["127.0.0.1:8443"],
                     "routes": [
                         {
                             "match": [
@@ -57,7 +54,7 @@
                                     "handler": "proxy",
                                     "upstreams": [
                                         {
-                                            "dial": ["localhost:9001"]
+                                            "dial": ["127.0.0.1:9001"]
                                         }
                                     ]
                                 }
@@ -69,7 +66,7 @@
         },
         "tls": {
             "certificates": {
-                "automate": ["localhost"]
+                "automate": ["localhost", "127.0.0.1"]
             },
             "automation": {
                 "policies": [{

@@ -23,6 +23,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/json"
 	"fmt"
 	weakrand "math/rand"
 	"net"
@@ -31,7 +32,9 @@ import (
 	"time"
 
 	"github.com/mholt/acmez"
+	"github.com/mholt/acmez/acme"
 	"go.uber.org/zap"
+	"golang.org/x/net/idna"
 )
 
 // Config configures a certificate manager instance.
@@ -82,6 +85,14 @@ type Config struct {
 	// if not set, DefaultCertificateSelector will
 	// be used.
 	CertSelection CertificateSelector
+
+	// OCSP configures how OCSP is handled. By default,
+	// OCSP responses are fetched for every certificate
+	// with a responder URL, and cached on disk. Changing
+	// these defaults is STRONGLY discouraged unless you
+	// have a compelling reason to put clients at greater
+	// risk and reduce their privacy.
+	OCSP OCSPConfig
 
 	// The storage to access when storing or loading
 	// TLS assets. Default is the local file system.
@@ -237,6 +248,29 @@ func newWithCache(certCache *Cache, cfg Config) *Config {
 // that errors can be reported and fixed immediately.
 func (cfg *Config) ManageSync(domainNames []string) error {
 	return cfg.manageAll(nil, domainNames, false)
+}
+
+// ClientCredentials returns a list of TLS client certificate chains for the given identifiers.
+// The return value can be used in a tls.Config to enable client authentication using managed certificates.
+// Any certificates that need to be obtained or renewed for these identifiers will be managed accordingly.
+func (cfg *Config) ClientCredentials(ctx context.Context, identifiers []string) ([]tls.Certificate, error) {
+	err := cfg.manageAll(ctx, identifiers, false)
+	if err != nil {
+		return nil, err
+	}
+	var chains []tls.Certificate
+	for _, id := range identifiers {
+		certRes, err := cfg.loadCertResourceAnyIssuer(id)
+		if err != nil {
+			return chains, err
+		}
+		chain, err := tls.X509KeyPair(certRes.CertificatePEM, certRes.PrivateKeyPEM)
+		if err != nil {
+			return chains, err
+		}
+		chains = append(chains, chain)
+	}
+	return chains, nil
 }
 
 // ManageAsync is the same as ManageSync, except that ACME
@@ -405,7 +439,7 @@ func (cfg *Config) obtainCert(ctx context.Context, name string, interactive bool
 	lockKey := cfg.lockKey(certIssueLockOp, name)
 	err := acquireLock(ctx, cfg.Storage, lockKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to acquire lock '%s': %v", lockKey, err)
 	}
 	defer func() {
 		if log != nil {
@@ -647,7 +681,12 @@ func (cfg *Config) generateCSR(privateKey crypto.PrivateKey, sans []string) (*x5
 		} else if u, err := url.Parse(name); err == nil && strings.Contains(name, "/") {
 			csrTemplate.URIs = append(csrTemplate.URIs, u)
 		} else {
-			csrTemplate.DNSNames = append(csrTemplate.DNSNames, name)
+			// convert IDNs to ASCII according to RFC 5280 section 7
+			normalizedName, err := idna.ToASCII(name)
+			if err != nil {
+				return nil, fmt.Errorf("converting identifier '%s' to ASCII: %v", name, err)
+			}
+			csrTemplate.DNSNames = append(csrTemplate.DNSNames, normalizedName)
 		}
 	}
 
@@ -739,6 +778,52 @@ func (cfg *Config) TLSConfig() *tls.Config {
 	}
 }
 
+// getChallengeInfo loads the challenge info from either the internal challenge memory
+// or the external storage (implying distributed solving). The second return value
+// indicates whether challenge info was loaded from external storage. If true, the
+// challenge is being solved in a distributed fashion; if false, from internal memory.
+// If no matching challenge information can be found, an error is returned.
+func (cfg *Config) getChallengeInfo(identifier string) (Challenge, bool, error) {
+	// first, check if our process initiated this challenge; if so, just return it
+	chalData, ok := GetACMEChallenge(identifier)
+	if ok {
+		return chalData, false, nil
+	}
+
+	// otherwise, perhaps another instance in the cluster initiated it; check
+	// the configured storage to retrieve challenge data
+
+	var chalInfo acme.Challenge
+	var chalInfoBytes []byte
+	var tokenKey string
+	for _, issuer := range cfg.Issuers {
+		ds := distributedSolver{
+			storage:                cfg.Storage,
+			storageKeyIssuerPrefix: storageKeyACMECAPrefix(issuer.IssuerKey()),
+		}
+		tokenKey = ds.challengeTokensKey(identifier)
+		var err error
+		chalInfoBytes, err = cfg.Storage.Load(tokenKey)
+		if err == nil {
+			break
+		}
+		if _, ok := err.(ErrNotExist); ok {
+			continue
+		}
+		return Challenge{}, false, fmt.Errorf("opening distributed challenge token file %s: %v", tokenKey, err)
+	}
+	if len(chalInfoBytes) == 0 {
+		return Challenge{}, false, fmt.Errorf("no information found to solve challenge for identifier: %s", identifier)
+	}
+
+	err := json.Unmarshal(chalInfoBytes, &chalInfo)
+	if err != nil {
+		return Challenge{}, false, fmt.Errorf("decoding challenge token file %s (corrupted?): %v", tokenKey, err)
+	}
+
+	return Challenge{Challenge: chalInfo}, true, nil
+}
+
 // checkStorage tests the storage by writing random bytes
 // to a random key, and then loading those bytes and
 // comparing the loaded value. If this fails, the provided
@@ -827,6 +912,22 @@ func loggerNamed(l *zap.Logger, name string) *zap.Logger {
 // CertificateSelector is a type which can select a certificate to use given multiple choices.
 type CertificateSelector interface {
 	SelectCertificate(*tls.ClientHelloInfo, []Certificate) (Certificate, error)
+}
+
+// OCSPConfig configures how OCSP is handled.
+type OCSPConfig struct {
+	// Disable automatic OCSP stapling; strongly
+	// discouraged unless you have a good reason.
+	// Disabling this puts clients at greater risk
+	// and reduces their privacy.
+	DisableStapling bool
+
+	// A map of OCSP responder domains to replacement
+	// domains for querying OCSP servers. Used for
+	// overriding the OCSP responder URL that is
+	// embedded in certificates. Mapping to an empty
+	// URL will disable OCSP from that responder.
+	ResponderOverrides map[string]string
 }
 
 // certIssueLockOp is the name of the operation used

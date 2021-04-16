@@ -409,8 +409,7 @@ func (app *App) makeRedirRoute(redirToPort uint, matcherSet MatcherSet) Route {
 			StaticResponse{
 				StatusCode: WeakString(strconv.Itoa(http.StatusPermanentRedirect)),
 				Headers: http.Header{
-					"Location":   []string{redirTo},
-					"Connection": []string{"close"},
+					"Location": []string{redirTo},
 				},
 				Close: true,
 			},
@@ -445,7 +444,7 @@ func (app *App) createAutomationPolicies(ctx caddy.Context, internalNames []stri
 		// what the HTTP and HTTPS ports are)
 		if ap.Issuers == nil {
 			var err error
-			ap.Issuers, err = caddytls.DefaultIssuers(ctx)
+			ap.Issuers, err = caddytls.DefaultIssuersProvisioned(ctx)
 			if err != nil {
 				return err
 			}
@@ -500,7 +499,7 @@ func (app *App) createAutomationPolicies(ctx caddy.Context, internalNames []stri
 	// never overwrite any other issuer that might already be configured
 	if basePolicy.Issuers == nil {
 		var err error
-		basePolicy.Issuers, err = caddytls.DefaultIssuers(ctx)
+		basePolicy.Issuers, err = caddytls.DefaultIssuersProvisioned(ctx)
 		if err != nil {
 			return err
 		}

@@ -178,6 +178,7 @@ config file; otherwise the default is assumed.`,
 			fs.String("config", "", "Configuration file (required)")
 			fs.String("adapter", "", "Name of config adapter to apply")
 			fs.String("address", "", "Address of the administration listener, if different from config")
+			fs.Bool("force", false, "Force config reload, even if it is the same")
 			return fs
 		}(),
 	})
@@ -191,10 +192,11 @@ config file; otherwise the default is assumed.`,
 	RegisterCommand(Command{
 		Name:  "list-modules",
 		Func:  cmdListModules,
-		Usage: "[--versions]",
+		Usage: "[--packages] [--versions]",
 		Short: "Lists the installed Caddy modules",
 		Flags: func() *flag.FlagSet {
 			fs := flag.NewFlagSet("list-modules", flag.ExitOnError)
+			fs.Bool("packages", false, "Print package paths")
 			fs.Bool("versions", false, "Print version information")
 			return fs
 		}(),
@@ -274,6 +276,15 @@ is always printed to stdout.`,
 			fs.Bool("overwrite", false, "Overwrite the input file with the results")
 			return fs
 		}(),
+	})
+
+	RegisterCommand(Command{
+		Name:  "upgrade",
+		Func:  cmdUpgrade,
+		Short: "Upgrade Caddy (EXPERIMENTAL)",
+		Long: `
+Downloads an updated Caddy binary with the same modules/plugins at the
+latest versions. EXPERIMENTAL: May be changed or removed.`,
 	})
 
 }

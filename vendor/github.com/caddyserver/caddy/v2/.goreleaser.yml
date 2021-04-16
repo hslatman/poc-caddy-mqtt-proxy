@@ -11,6 +11,9 @@ before:
     # GoReleaser doesn't seem to offer {{.Tag}} at this stage, so we have to embed it into the env
     # so we run: TAG=$(git describe --abbrev=0) goreleaser release --rm-dist --skip-publish --skip-validate
     - go mod edit -require=github.com/caddyserver/caddy/v2@{{.Env.TAG}} ./caddy-build/go.mod
+    # as of Go 1.16, `go` commands no longer automatically change go.{mod,sum}. We now have to explicitly
+    # run `go mod tidy`. The `/bin/sh -c '...'` is because goreleaser can't find cd in PATH without shell invocation.
+    - /bin/sh -c 'cd ./caddy-build && go mod tidy'
     - git clone --depth 1 https://github.com/caddyserver/dist caddy-dist
     - go mod download
 
@@ -84,13 +87,22 @@ nfpms:
       # - rpm
 
     bindir: /usr/bin
-    files:
-      ./caddy-dist/init/caddy.service: /lib/systemd/system/caddy.service
-      ./caddy-dist/init/caddy-api.service: /lib/systemd/system/caddy-api.service
-      ./caddy-dist/welcome/index.html: /usr/share/caddy/index.html
-      ./caddy-dist/scripts/completions/bash-completion: /etc/bash_completion.d/caddy
-    config_files:
-      ./caddy-dist/config/Caddyfile: /etc/caddy/Caddyfile
+    contents:
+      - src: ./caddy-dist/init/caddy.service
+        dst: /lib/systemd/system/caddy.service
+        
+      - src: ./caddy-dist/init/caddy-api.service
+        dst: /lib/systemd/system/caddy-api.service
+      
+      - src: ./caddy-dist/welcome/index.html
+        dst: /usr/share/caddy/index.html
+      
+      - src: ./caddy-dist/scripts/completions/bash-completion
+        dst: /etc/bash_completion.d/caddy
+    
+      - src: ./caddy-dist/config/Caddyfile
+        dst: /etc/caddy/Caddyfile
+        type: config
 
     scripts:
       postinstall: ./caddy-dist/scripts/postinstall.sh
