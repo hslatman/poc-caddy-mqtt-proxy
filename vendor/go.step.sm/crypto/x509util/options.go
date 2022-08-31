@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/base64"
-	"io/ioutil"
+	"os"
 	"text/template"
 
 	"github.com/Masterminds/sprig/v3"
@@ -16,8 +16,13 @@ import (
 // function "fail" to set the given string, this way we can report template
 // errors directly to the template without having the wrapper that text/template
 // adds.
+//
+// sprig "env" and "expandenv" functions are removed to avoid the leak of
+// information.
 func getFuncMap(failMessage *string) template.FuncMap {
 	m := sprig.TxtFuncMap()
+	delete(m, "env")
+	delete(m, "expandenv")
 	m["fail"] = func(msg string) (string, error) {
 		*failMessage = msg
 		return "", errors.New(msg)
@@ -85,7 +90,7 @@ func WithTemplateBase64(s string, data TemplateData) Option {
 func WithTemplateFile(path string, data TemplateData) Option {
 	return func(cr *x509.CertificateRequest, o *Options) error {
 		filename := step.Abs(path)
-		b, err := ioutil.ReadFile(filename)
+		b, err := os.ReadFile(filename)
 		if err != nil {
 			return errors.Wrapf(err, "error reading %s", path)
 		}

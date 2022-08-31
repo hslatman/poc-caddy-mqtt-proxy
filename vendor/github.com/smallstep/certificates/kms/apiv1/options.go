@@ -16,23 +16,49 @@ type KeyManager interface {
 	Close() error
 }
 
+// Decrypter is an interface implemented by KMSes that are used
+// in operations that require decryption
+type Decrypter interface {
+	CreateDecrypter(req *CreateDecrypterRequest) (crypto.Decrypter, error)
+}
+
 // CertificateManager is the interface implemented by the KMS that can load and
 // store x509.Certificates.
 type CertificateManager interface {
-	LoadCerticate(req *LoadCertificateRequest) (*x509.Certificate, error)
+	LoadCertificate(req *LoadCertificateRequest) (*x509.Certificate, error)
 	StoreCertificate(req *StoreCertificateRequest) error
 }
 
-// ErrNotImplemented
+// ValidateName is an interface that KeyManager can implement to validate a
+// given name or URI.
+type NameValidator interface {
+	ValidateName(s string) error
+}
+
+// ErrNotImplemented is the type of error returned if an operation is not
+// implemented.
 type ErrNotImplemented struct {
-	msg string
+	Message string
 }
 
 func (e ErrNotImplemented) Error() string {
-	if e.msg != "" {
-		return e.msg
+	if e.Message != "" {
+		return e.Message
 	}
 	return "not implemented"
+}
+
+// ErrAlreadyExists is the type of error returned if a key already exists. This
+// is currently only implmented on pkcs11.
+type ErrAlreadyExists struct {
+	Message string
+}
+
+func (e ErrAlreadyExists) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return "key already exists"
 }
 
 // Type represents the KMS type used.
@@ -51,26 +77,45 @@ const (
 	PKCS11 Type = "pkcs11"
 	// YubiKey is a KMS implementation using a YubiKey PIV.
 	YubiKey Type = "yubikey"
+	// SSHAgentKMS is a KMS implementation using ssh-agent to access keys.
+	SSHAgentKMS Type = "sshagentkms"
+	// AzureKMS is a KMS implementation using Azure Key Vault.
+	AzureKMS Type = "azurekms"
 )
 
+// Options are the KMS options. They represent the kms object in the ca.json.
 type Options struct {
 	// The type of the KMS to use.
 	Type string `json:"type"`
 
 	// Path to the credentials file used in CloudKMS and AmazonKMS.
-	CredentialsFile string `json:"credentialsFile"`
+	CredentialsFile string `json:"credentialsFile,omitempty"`
 
-	// Path to the module used with PKCS11 KMS.
-	Module string `json:"module"`
+	// URI is based on the PKCS #11 URI Scheme defined in
+	// https://tools.ietf.org/html/rfc7512 and represents the configuration used
+	// to connect to the KMS.
+	//
+	// Used by: pkcs11
+	URI string `json:"uri,omitempty"`
 
-	// Pin used to access the PKCS11 module.
-	Pin string `json:"pin"`
+	// Pin used to access the PKCS11 module. It can be defined in the URI using
+	// the pin-value or pin-source properties.
+	Pin string `json:"pin,omitempty"`
+
+	// ManagementKey used in YubiKeys. Default management key is the hexadecimal
+	// string 010203040506070801020304050607080102030405060708:
+	//   []byte{
+	//       0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	//       0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	//       0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	//   }
+	ManagementKey string `json:"managementKey,omitempty"`
 
 	// Region to use in AmazonKMS.
-	Region string `json:"region"`
+	Region string `json:"region,omitempty"`
 
 	// Profile to use in AmazonKMS.
-	Profile string `json:"profile"`
+	Profile string `json:"profile,omitempty"`
 }
 
 // Validate checks the fields in Options.
@@ -80,10 +125,10 @@ func (o *Options) Validate() error {
 	}
 
 	switch Type(strings.ToLower(o.Type)) {
-	case DefaultKMS, SoftKMS, CloudKMS, AmazonKMS:
-	case YubiKey:
-	case PKCS11:
-		return ErrNotImplemented{"support for PKCS11 is not yet implemented"}
+	case DefaultKMS, SoftKMS: // Go crypto based kms.
+	case CloudKMS, AmazonKMS, AzureKMS: // Cloud based kms.
+	case YubiKey, PKCS11: // Hardware based kms.
+	case SSHAgentKMS: // Others
 	default:
 		return errors.Errorf("unsupported kms type %s", o.Type)
 	}

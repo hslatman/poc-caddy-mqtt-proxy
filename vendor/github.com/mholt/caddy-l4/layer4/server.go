@@ -16,7 +16,6 @@ package layer4
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -28,7 +27,12 @@ import (
 
 // Server represents a Caddy layer4 server.
 type Server struct {
-	Listen []string  `json:"listen,omitempty"`
+	// The network address to bind to. Any Caddy network address
+	// is an acceptable value:
+	// https://caddyserver.com/docs/conventions#network-addresses
+	Listen []string `json:"listen,omitempty"`
+
+	// Routes express composable logic for handling byte streams.
 	Routes RouteList `json:"routes,omitempty"`
 
 	logger        *zap.Logger
@@ -60,6 +64,10 @@ func (s *Server) Provision(ctx caddy.Context, logger *zap.Logger) error {
 func (s Server) serve(ln net.Listener) error {
 	for {
 		conn, err := ln.Accept()
+		if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
+			s.logger.Error("accepting connection: temporary error", zap.Error(err))
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -88,23 +96,11 @@ func (s Server) servePacket(pc net.PacketConn) error {
 func (s Server) handle(conn net.Conn) {
 	defer conn.Close()
 
-	repl := caddy.NewReplacer()
-	repl.Set("l4.conn.remote_addr", conn.RemoteAddr())
-	repl.Set("l4.conn.local_addr", conn.LocalAddr())
-
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]interface{}))
-	ctx = context.WithValue(ctx, ReplacerCtxKey, repl)
-
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	defer bufPool.Put(buf)
 
-	cx := &Connection{
-		Conn:    conn,
-		Context: ctx,
-		buf:     buf,
-	}
+	cx := WrapConnection(conn, buf)
 
 	start := time.Now()
 	err := s.compiledRoute.Handle(cx)
@@ -114,6 +110,7 @@ func (s Server) handle(conn net.Conn) {
 	}
 
 	s.logger.Debug("connection stats",
+		zap.String("remote", cx.RemoteAddr().String()),
 		zap.Uint64("read", cx.bytesRead),
 		zap.Uint64("written", cx.bytesWritten),
 		zap.Duration("duration", duration),
@@ -134,9 +131,12 @@ func (pc packetConn) Write(b []byte) (n int, err error) {
 	return pc.PacketConn.WriteTo(b, pc.addr)
 }
 
-func (pc packetConn) RemoteAddr() net.Addr { return pc.addr }
+func (pc packetConn) Close() error {
+	// Do nothing, we don't want to close the UDP server
+	return nil
+}
 
-func (packetConn) Close() error { return nil }
+func (pc packetConn) RemoteAddr() net.Addr { return pc.addr }
 
 var udpBufPool = sync.Pool{
 	New: func() interface{} {

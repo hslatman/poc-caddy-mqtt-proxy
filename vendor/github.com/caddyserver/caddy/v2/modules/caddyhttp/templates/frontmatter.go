@@ -6,8 +6,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/naoina/toml"
-	"gopkg.in/yaml.v2"
+	"github.com/BurntSushi/toml"
+	"gopkg.in/yaml.v3"
 )
 
 func extractFrontMatter(input string) (map[string]interface{}, string, error) {

@@ -17,10 +17,11 @@ package caddy
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -111,16 +112,26 @@ func Load(cfgJSON []byte, forceReload bool) error {
 		}
 	}()
 
-	return changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, forceReload)
+	err := changeConfig(http.MethodPost, "/"+rawConfigKey, cfgJSON, "", forceReload)
+	if errors.Is(err, errSameConfig) {
+		err = nil // not really an error
+	}
+	return err
 }
 
 // changeConfig changes the current config (rawCfg) according to the
 // method, traversed via the given path, and uses the given input as
 // the new value (if applicable; i.e. "DELETE" doesn't have an input).
 // If the resulting config is the same as the previous, no reload will
-// occur unless forceReload is true. This function is safe for
+// occur unless forceReload is true. If the config is unchanged and not
+// forcefully reloaded, then errConfigUnchanged This function is safe for
 // concurrent use.
-func changeConfig(method, path string, input []byte, forceReload bool) error {
+// The ifMatchHeader can optionally be given a string of the format:
+//    "<path> <hash>"
+// where <path> is the absolute path in the config and <hash> is the expected hash of
+// the config at that path. If the hash in the ifMatchHeader doesn't match
+// the hash of the config, then an APIError with status 412 will be returned.
+func changeConfig(method, path string, input []byte, ifMatchHeader string, forceReload bool) error {
 	switch method {
 	case http.MethodGet,
 		http.MethodHead,
@@ -132,6 +143,40 @@ func changeConfig(method, path string, input []byte, forceReload bool) error {
 
 	currentCfgMu.Lock()
 	defer currentCfgMu.Unlock()
+
+	if ifMatchHeader != "" {
+		// expect the first and last character to be quotes
+		if len(ifMatchHeader) < 2 || ifMatchHeader[0] != '"' || ifMatchHeader[len(ifMatchHeader)-1] != '"' {
+			return APIError{
+				HTTPStatus: http.StatusBadRequest,
+				Err:        fmt.Errorf("malformed If-Match header; expect quoted string"),
+			}
+		}
+
+		// read out the parts
+		parts := strings.Fields(ifMatchHeader[1 : len(ifMatchHeader)-1])
+		if len(parts) != 2 {
+			return APIError{
+				HTTPStatus: http.StatusBadRequest,
+				Err:        fmt.Errorf("malformed If-Match header; expect format \"<path> <hash>\""),
+			}
+		}
+
+		// get the current hash of the config
+		// at the given path
+		hash := etagHasher()
+		err := unsyncedConfigAccess(http.MethodGet, parts[0], nil, hash)
+		if err != nil {
+			return err
+		}
+
+		if hex.EncodeToString(hash.Sum(nil)) != parts[1] {
+			return APIError{
+				HTTPStatus: http.StatusPreconditionFailed,
+				Err:        fmt.Errorf("If-Match header did not match current config hash"),
+			}
+		}
+	}
 
 	err := unsyncedConfigAccess(method, path, input, nil)
 	if err != nil {
@@ -149,8 +194,8 @@ func changeConfig(method, path string, input []byte, forceReload bool) error {
 
 	// if nothing changed, no need to do a whole reload unless the client forces it
 	if !forceReload && bytes.Equal(rawCfgJSON, newCfg) {
-		Log().Named("admin.api").Info("config is unchanged")
-		return nil
+		Log().Info("config is unchanged")
+		return errSameConfig
 	}
 
 	// find any IDs in this config and index them
@@ -268,8 +313,9 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 		newCfg != nil &&
 		newCfg.Admin != nil &&
 		newCfg.Admin.Config != nil &&
-		newCfg.Admin.Config.LoadRaw != nil {
-		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs")
+		newCfg.Admin.Config.LoadRaw != nil &&
+		newCfg.Admin.Config.LoadDelay <= 0 {
+		return fmt.Errorf("recursive config loading detected: pulled configs cannot pull other configs without positive load_delay")
 	}
 
 	// run the new config and start all its apps
@@ -299,7 +345,7 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 				zap.String("dir", dir),
 				zap.Error(err))
 		} else {
-			err := ioutil.WriteFile(ConfigAutosavePath, cfgJSON, 0600)
+			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0600)
 			if err == nil {
 				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
 			} else {
@@ -427,9 +473,16 @@ func run(newCfg *Config, start bool) error {
 		return nil
 	}
 
+	// Provision any admin routers which may need to access
+	// some of the other apps at runtime
+	err = newCfg.Admin.provisionAdminRouters(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Start
 	err = func() error {
-		var started []string
+		started := make([]string, 0, len(newCfg.apps))
 		for name, a := range newCfg.apps {
 			err := a.Start()
 			if err != nil {
@@ -480,30 +533,74 @@ func finishSettingUp(ctx Context, cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("loading config loader module: %s", err)
 		}
-		loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
-		if err != nil {
-			return fmt.Errorf("loading dynamic config from %T: %v", val, err)
+
+		logger := Log().Named("config_loader").With(
+			zap.String("module", val.(Module).CaddyModule().ID.Name()),
+			zap.Int("load_delay", int(cfg.Admin.Config.LoadDelay)))
+
+		runLoadedConfig := func(config []byte) error {
+			logger.Info("applying dynamically-loaded config")
+			err := changeConfig(http.MethodPost, "/"+rawConfigKey, config, "", false)
+			if errors.Is(err, errSameConfig) {
+				return err
+			}
+			if err != nil {
+				logger.Error("failed to run dynamically-loaded config", zap.Error(err))
+				return err
+			}
+			logger.Info("successfully applied dynamically-loaded config")
+			return nil
 		}
 
-		// do this in a goroutine so current config can finish being loaded; otherwise deadlock
-		go func() {
-			Log().Info("applying dynamically-loaded config", zap.String("loader_module", val.(Module).CaddyModule().ID.Name()))
-			currentCfgMu.Lock()
-			err := unsyncedDecodeAndRun(loadedConfig, false)
-			currentCfgMu.Unlock()
-			if err == nil {
-				Log().Info("dynamically-loaded config applied successfully")
-			} else {
-				Log().Error("running dynamically-loaded config failed", zap.Error(err))
+		if cfg.Admin.Config.LoadDelay > 0 {
+			go func() {
+				// the loop is here to iterate ONLY if there is an error, a no-op config load,
+				// or an unchanged config; in which case we simply wait the delay and try again
+				for {
+					timer := time.NewTimer(time.Duration(cfg.Admin.Config.LoadDelay))
+					select {
+					case <-timer.C:
+						loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
+						if err != nil {
+							logger.Error("failed loading dynamic config; will retry", zap.Error(err))
+							continue
+						}
+						if loadedConfig == nil {
+							logger.Info("dynamically-loaded config was nil; will retry")
+							continue
+						}
+						err = runLoadedConfig(loadedConfig)
+						if errors.Is(err, errSameConfig) {
+							logger.Info("dynamically-loaded config was unchanged; will retry")
+							continue
+						}
+					case <-ctx.Done():
+						if !timer.Stop() {
+							<-timer.C
+						}
+						logger.Info("stopping dynamic config loading")
+					}
+					break
+				}
+			}()
+		} else {
+			// if no LoadDelay is provided, will load config synchronously
+			loadedConfig, err := val.(ConfigLoader).LoadConfig(ctx)
+			if err != nil {
+				return fmt.Errorf("loading dynamic config from %T: %v", val, err)
 			}
-		}()
+			// do this in a goroutine so current config can finish being loaded; otherwise deadlock
+			go func() { _ = runLoadedConfig(loadedConfig) }()
+		}
 	}
 
 	return nil
 }
 
-// ConfigLoader is a type that can load a Caddy config. The
-// returned config must be valid Caddy JSON.
+// ConfigLoader is a type that can load a Caddy config. If
+// the return value is non-nil, it must be valid Caddy JSON;
+// if nil or with non-nil error, it is considered to be a
+// no-op load and may be retried later.
 type ConfigLoader interface {
 	LoadConfig(Context) ([]byte, error)
 }
@@ -564,7 +661,7 @@ func Validate(cfg *Config) error {
 // PID file, and shuts down admin endpoint(s) in a goroutine.
 // Errors are logged along the way, and an appropriate exit
 // code is emitted.
-func exitProcess(logger *zap.Logger) {
+func exitProcess(ctx context.Context, logger *zap.Logger) {
 	if logger == nil {
 		logger = Log()
 	}
@@ -579,7 +676,7 @@ func exitProcess(logger *zap.Logger) {
 	}
 
 	// clean up certmagic locks
-	certmagic.CleanUpOwnLocks(logger)
+	certmagic.CleanUpOwnLocks(ctx, logger)
 
 	// remove pidfile
 	if pidfile != "" {
@@ -680,13 +777,13 @@ func ParseDuration(s string) (time.Duration, error) {
 // have its own unique ID.
 func InstanceID() (uuid.UUID, error) {
 	uuidFilePath := filepath.Join(AppDataDir(), "instance.uuid")
-	uuidFileBytes, err := ioutil.ReadFile(uuidFilePath)
+	uuidFileBytes, err := os.ReadFile(uuidFilePath)
 	if os.IsNotExist(err) {
 		uuid, err := uuid.NewRandom()
 		if err != nil {
 			return uuid, err
 		}
-		err = ioutil.WriteFile(uuidFilePath, []byte(uuid.String()), 0600)
+		err = os.WriteFile(uuidFilePath, []byte(uuid.String()), 0600)
 		return uuid, err
 	} else if err != nil {
 		return [16]byte{}, err
@@ -754,6 +851,11 @@ var (
 	// path, for converting /id/ paths to /config/ paths.
 	rawCfgIndex map[string]string
 )
+
+// errSameConfig is returned if the new config is the same
+// as the old one. This isn't usually an actual, actionable
+// error; it's mostly a sentinel value.
+var errSameConfig = errors.New("config is unchanged")
 
 // ImportPath is the package import path for Caddy core.
 const ImportPath = "github.com/caddyserver/caddy/v2"

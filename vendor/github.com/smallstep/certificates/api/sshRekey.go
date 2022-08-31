@@ -2,11 +2,14 @@ package api
 
 import (
 	"net/http"
+	"time"
 
-	"github.com/pkg/errors"
+	"golang.org/x/crypto/ssh"
+
+	"github.com/smallstep/certificates/api/read"
+	"github.com/smallstep/certificates/api/render"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/errs"
-	"golang.org/x/crypto/ssh"
 )
 
 // SSHRekeyRequest is the request body of an SSH certificate request.
@@ -18,10 +21,10 @@ type SSHRekeyRequest struct {
 // Validate validates the SSHSignRekey.
 func (s *SSHRekeyRequest) Validate() error {
 	switch {
-	case len(s.OTT) == 0:
-		return errors.New("missing or empty ott")
+	case s.OTT == "":
+		return errs.BadRequest("missing or empty ott")
 	case len(s.PublicKey) == 0:
-		return errors.New("missing or empty public key")
+		return errs.BadRequest("missing or empty public key")
 	default:
 		return nil
 	}
@@ -38,47 +41,52 @@ type SSHRekeyResponse struct {
 // the request.
 func (h *caHandler) SSHRekey(w http.ResponseWriter, r *http.Request) {
 	var body SSHRekeyRequest
-	if err := ReadJSON(r.Body, &body); err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error reading request body"))
+	if err := read.JSON(r.Body, &body); err != nil {
+		render.Error(w, errs.BadRequestErr(err, "error reading request body"))
 		return
 	}
 
 	logOtt(w, body.OTT)
 	if err := body.Validate(); err != nil {
-		WriteError(w, errs.BadRequestErr(err))
+		render.Error(w, err)
 		return
 	}
 
 	publicKey, err := ssh.ParsePublicKey(body.PublicKey)
 	if err != nil {
-		WriteError(w, errs.Wrap(http.StatusBadRequest, err, "error parsing publicKey"))
+		render.Error(w, errs.BadRequestErr(err, "error parsing publicKey"))
 		return
 	}
 
 	ctx := provisioner.NewContextWithMethod(r.Context(), provisioner.SSHRekeyMethod)
 	signOpts, err := h.Authority.Authorize(ctx, body.OTT)
 	if err != nil {
-		WriteError(w, errs.UnauthorizedErr(err))
+		render.Error(w, errs.UnauthorizedErr(err))
 		return
 	}
 	oldCert, _, err := provisioner.ExtractSSHPOPCert(body.OTT)
 	if err != nil {
-		WriteError(w, errs.InternalServerErr(err))
+		render.Error(w, errs.InternalServerErr(err))
+		return
 	}
 
 	newCert, err := h.Authority.RekeySSH(ctx, oldCert, publicKey, signOpts...)
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		render.Error(w, errs.ForbiddenErr(err, "error rekeying ssh certificate"))
 		return
 	}
 
-	identity, err := h.renewIdentityCertificate(r)
+	// Match identity cert with the SSH cert
+	notBefore := time.Unix(int64(oldCert.ValidAfter), 0)
+	notAfter := time.Unix(int64(oldCert.ValidBefore), 0)
+
+	identity, err := h.renewIdentityCertificate(r, notBefore, notAfter)
 	if err != nil {
-		WriteError(w, errs.ForbiddenErr(err))
+		render.Error(w, errs.ForbiddenErr(err, "error renewing identity certificate"))
 		return
 	}
 
-	JSONStatus(w, &SSHRekeyResponse{
+	render.JSONStatus(w, &SSHRekeyResponse{
 		Certificate:         SSHCertificate{newCert},
 		IdentityCertificate: identity,
 	}, http.StatusCreated)

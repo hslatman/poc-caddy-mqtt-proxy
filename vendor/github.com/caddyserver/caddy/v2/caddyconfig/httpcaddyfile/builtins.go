@@ -19,8 +19,8 @@ import (
 	"encoding/pem"
 	"fmt"
 	"html"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -39,6 +39,7 @@ func init() {
 	RegisterDirective("bind", parseBind)
 	RegisterDirective("tls", parseTLS)
 	RegisterHandlerDirective("root", parseRoot)
+	RegisterHandlerDirective("vars", parseVars)
 	RegisterHandlerDirective("redir", parseRedir)
 	RegisterHandlerDirective("respond", parseRespond)
 	RegisterHandlerDirective("abort", parseAbort)
@@ -82,6 +83,7 @@ func parseBind(h Helper) ([]ConfigValue, error) {
 //         on_demand
 //         eab    <key_id> <mac_key>
 //         issuer <module_name> [...]
+//         get_certificate <module_name> [...]
 //     }
 //
 func parseTLS(h Helper) ([]ConfigValue, error) {
@@ -93,6 +95,7 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 	var keyType string
 	var internalIssuer *caddytls.InternalIssuer
 	var issuers []certmagic.Issuer
+	var certManagers []certmagic.Manager
 	var onDemand bool
 
 	for h.Next() {
@@ -126,10 +129,10 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 			// must load each cert only once; otherwise, they each get a
 			// different tag... since a cert loaded twice has the same
 			// bytes, it will overwrite the first one in the cache, and
-			// only the last cert (and its tag) will survive, so a any conn
-			// policy that is looking for any tag but the last one to be
-			// loaded won't find it, and TLS handshakes will fail (see end)
-			// of issue #3004)
+			// only the last cert (and its tag) will survive, so any conn
+			// policy that is looking for any tag other than the last one
+			// to be loaded won't find it, and TLS handshakes will fail
+			// (see end of issue #3004)
 			//
 			// tlsCertTags maps certificate filenames to their tag.
 			// This is used to remember which tag is used for each
@@ -230,7 +233,7 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 							return nil, h.ArgErr()
 						}
 						filename := h.Val()
-						certDataPEM, err := ioutil.ReadFile(filename)
+						certDataPEM, err := os.ReadFile(filename)
 						if err != nil {
 							return nil, err
 						}
@@ -307,6 +310,22 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 				}
 				issuers = append(issuers, issuer)
 
+			case "get_certificate":
+				if !h.NextArg() {
+					return nil, h.ArgErr()
+				}
+				modName := h.Val()
+				modID := "tls.get_certificate." + modName
+				unm, err := caddyfile.UnmarshalModule(h.Dispenser, modID)
+				if err != nil {
+					return nil, err
+				}
+				certManager, ok := unm.(certmagic.Manager)
+				if !ok {
+					return nil, h.Errf("module %s (%T) is not a certmagic.CertificateManager", modID, unm)
+				}
+				certManagers = append(certManagers, certManager)
+
 			case "dns":
 				if !h.NextArg() {
 					return nil, h.ArgErr()
@@ -343,6 +362,22 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 					acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
 				}
 				acmeIssuer.Challenges.DNS.Resolvers = args
+
+			case "dns_challenge_override_domain":
+				arg := h.RemainingArgs()
+				if len(arg) != 1 {
+					return nil, h.ArgErr()
+				}
+				if acmeIssuer == nil {
+					acmeIssuer = new(caddytls.ACMEIssuer)
+				}
+				if acmeIssuer.Challenges == nil {
+					acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
+				}
+				if acmeIssuer.Challenges.DNS == nil {
+					acmeIssuer.Challenges.DNS = new(caddytls.DNSChallengeConfig)
+				}
+				acmeIssuer.Challenges.DNS.OverrideDomain = arg[0]
 
 			case "ca_root":
 				arg := h.RemainingArgs()
@@ -453,6 +488,12 @@ func parseTLS(h Helper) ([]ConfigValue, error) {
 			Value: true,
 		})
 	}
+	for _, certManager := range certManagers {
+		configVals = append(configVals, ConfigValue{
+			Class: "tls.cert_manager",
+			Value: certManager,
+		})
+	}
 
 	// custom certificate selection
 	if len(certSelector.AnyTag) > 0 {
@@ -488,6 +529,13 @@ func parseRoot(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		}
 	}
 	return caddyhttp.VarsMiddleware{"root": root}, nil
+}
+
+// parseVars parses the vars directive. See its UnmarshalCaddyfile method for syntax.
+func parseVars(h Helper) (caddyhttp.MiddlewareHandler, error) {
+	v := new(caddyhttp.VarsMiddleware)
+	err := v.UnmarshalCaddyfile(h.Dispenser)
+	return v, err
 }
 
 // parseRedir parses the redir directive. Syntax:
@@ -532,12 +580,24 @@ func parseRedir(h Helper) (caddyhttp.MiddlewareHandler, error) {
 		body = fmt.Sprintf(metaRedir, safeTo, safeTo, safeTo, safeTo)
 		code = "302"
 	default:
+		// Allow placeholders for the code
+		if strings.HasPrefix(code, "{") {
+			break
+		}
+		// Try to validate as an integer otherwise
 		codeInt, err := strconv.Atoi(code)
 		if err != nil {
 			return nil, h.Errf("Not a supported redir code type or not valid integer: '%s'", code)
 		}
-		if codeInt < 300 || codeInt > 399 {
-			return nil, h.Errf("Redir code not in the 3xx range: '%v'", codeInt)
+		// Sometimes, a 401 with Location header is desirable because
+		// requests made with XHR will "eat" the 3xx redirect; so if
+		// the intent was to redirect to an auth page, a 3xx won't
+		// work. Responding with 401 allows JS code to read the
+		// Location header and do a window.location redirect manually.
+		// see https://stackoverflow.com/a/2573589/846934
+		// see https://github.com/oauth2-proxy/oauth2-proxy/issues/1522
+		if codeInt < 300 || (codeInt > 399 && codeInt != 401) {
+			return nil, h.Errf("Redir code not in the 3xx range or 401: '%v'", codeInt)
 		}
 	}
 

@@ -93,7 +93,7 @@ func (m MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 		return false, err
 	}
 
-	// parse the ClientHello and store it in the map
+	// parse the ClientHello
 	chi := parseRawClientHello(rawHello)
 	chi.Conn = cx
 
@@ -114,7 +114,10 @@ func (m MatchTLS) Match(cx *layer4.Connection) (bool, error) {
 		}
 	}
 
-	m.logger.Debug("matched", zap.String("server_name", chi.ClientHelloInfo.ServerName))
+	m.logger.Debug("matched",
+		zap.String("remote", cx.RemoteAddr().String()),
+		zap.String("server_name", chi.ClientHelloInfo.ServerName),
+	)
 
 	return true, nil
 }

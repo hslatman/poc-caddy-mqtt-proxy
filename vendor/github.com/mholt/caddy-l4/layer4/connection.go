@@ -24,6 +24,27 @@ import (
 	"github.com/caddyserver/caddy/v2"
 )
 
+// WrapConnection wraps an underlying connection into a layer4 connection that
+// supports recording and rewinding, as well as adding context with a replacer
+// and variable table. This function is intended for use at the start of a
+// connection handler chain where the underlying connection is not yet a layer4
+// Connection value.
+func WrapConnection(underlying net.Conn, buf *bytes.Buffer) *Connection {
+	repl := caddy.NewReplacer()
+	repl.Set("l4.conn.remote_addr", underlying.RemoteAddr())
+	repl.Set("l4.conn.local_addr", underlying.LocalAddr())
+
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, VarsCtxKey, make(map[string]interface{}))
+	ctx = context.WithValue(ctx, ReplacerCtxKey, repl)
+
+	return &Connection{
+		Conn:    underlying,
+		Context: ctx,
+		buf:     buf,
+	}
+}
+
 // Connection contains information about the connection as it
 // passes through various handlers. It also has the capability
 // of recording and rewinding when necessary.
@@ -92,9 +113,27 @@ func (cx *Connection) Write(p []byte) (n int, err error) {
 	return
 }
 
-// record starts recording the stream into cx.buf.
+// Wrap wraps conn in a new Connection based on cx (reusing
+// cx's existing buffer and context). This is useful after
+// a connection is wrapped by a package that does not support
+// our Connection type (for example, `tls.Server()`).
+func (cx *Connection) Wrap(conn net.Conn) *Connection {
+	return &Connection{
+		Conn:         conn,
+		Context:      cx.Context,
+		buf:          cx.buf,
+		bufReader:    cx.bufReader,
+		recording:    cx.recording,
+		bytesRead:    cx.bytesRead,
+		bytesWritten: cx.bytesWritten,
+	}
+}
+
+// record starts recording the stream into cx.buf. It also creates a reader
+// to read from the buffer but not to discard any byte.
 func (cx *Connection) record() {
 	cx.recording = true
+	cx.bufReader = bytes.NewReader(cx.buf.Bytes()) // Don't discard bytes.
 }
 
 // rewind stops recording and creates a reader for the
@@ -103,7 +142,7 @@ func (cx *Connection) record() {
 // continue with the underlying conn.
 func (cx *Connection) rewind() {
 	cx.recording = false
-	cx.bufReader = bytes.NewReader(cx.buf.Bytes())
+	cx.bufReader = cx.buf // Actually consume bytes.
 }
 
 // SetVar sets a value in the context's variable table with

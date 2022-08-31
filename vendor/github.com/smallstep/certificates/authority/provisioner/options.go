@@ -83,7 +83,7 @@ func CustomTemplateOptions(o *Options, data x509util.TemplateData, defaultTempla
 
 	if opts != nil {
 		// Add template data if any.
-		if len(opts.TemplateData) > 0 {
+		if len(opts.TemplateData) > 0 && string(opts.TemplateData) != "null" {
 			if err := json.Unmarshal(opts.TemplateData, &data); err != nil {
 				return nil, errors.Wrap(err, "error unmarshaling template data")
 			}
@@ -138,7 +138,7 @@ func unsafeParseSigned(s string) (map[string]interface{}, error) {
 		return nil, err
 	}
 	claims := make(map[string]interface{})
-	if err = token.UnsafeClaimsWithoutVerification(&claims); err != nil {
+	if err := token.UnsafeClaimsWithoutVerification(&claims); err != nil {
 		return nil, err
 	}
 	return claims, nil

@@ -15,11 +15,10 @@ import (
 	"crypto/rsa"
 	"encoding/binary"
 	"encoding/pem"
-	"fmt"
 	"math/big"
 
 	"github.com/pkg/errors"
-	"go.step.sm/crypto/internal/bcrypt_pbkdf"
+	bcryptpbkdf "go.step.sm/crypto/internal/bcrypt_pbkdf"
 	"go.step.sm/crypto/randutil"
 	"golang.org/x/crypto/ssh"
 )
@@ -81,16 +80,9 @@ func ParseOpenSSHPrivateKey(pemBytes []byte, opts ...Options) (crypto.PrivateKey
 	var err error
 	var key crypto.PrivateKey
 	if w.KdfName != "none" || w.CipherName != "none" {
-		var password []byte
-		if len(ctx.password) > 0 {
-			password = ctx.password
-		} else if PromptPassword != nil {
-			password, err = PromptPassword(fmt.Sprintf("Please enter the password to decrypt %s", ctx.filename))
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, errors.Errorf("error decoding %s: file is password protected", ctx.filename)
+		password, err := ctx.promptPassword()
+		if err != nil {
+			return nil, err
 		}
 		key, err = ssh.ParseRawPrivateKeyWithPassphrase(pemBytes, password)
 		if err != nil {
@@ -133,8 +125,13 @@ func SerializeOpenSSHPrivateKey(key crypto.PrivateKey, opts ...Options) (*pem.Bl
 		Check2: check,
 	}
 
+	password, err := ctx.promptEncryptPassword()
+	if err != nil {
+		return nil, err
+	}
+
 	var blockSize int
-	if ctx.password == nil {
+	if password == nil {
 		w.CipherName = "none"
 		w.KdfName = "none"
 		blockSize = 8
@@ -253,7 +250,7 @@ func SerializeOpenSSHPrivateKey(key crypto.PrivateKey, opts ...Options) (*pem.Bl
 		w.PrivKeyBlock = append(w.PrivKeyBlock, byte(i+1))
 	}
 
-	if ctx.password != nil {
+	if password != nil {
 		// Create encryption key derivation the password.
 		salt, err := randutil.Salt(sshDefaultSaltLength)
 		if err != nil {
@@ -266,7 +263,7 @@ func SerializeOpenSSHPrivateKey(key crypto.PrivateKey, opts ...Options) (*pem.Bl
 		w.KdfOpts = string(ssh.Marshal(kdfOpts))
 
 		// Derive key to encrypt the private key block.
-		k, err := bcrypt_pbkdf.Key(ctx.password, salt, sshDefaultRounds, sshDefaultKeyLength+aes.BlockSize)
+		k, err := bcryptpbkdf.Key(password, salt, sshDefaultRounds, sshDefaultKeyLength+aes.BlockSize)
 		if err != nil {
 			return nil, errors.Wrap(err, "error deriving decryption key")
 		}

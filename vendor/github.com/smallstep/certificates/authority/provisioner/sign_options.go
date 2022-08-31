@@ -6,14 +6,15 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/asn1"
 	"encoding/json"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/smallstep/certificates/errs"
+	"go.step.sm/crypto/keyutil"
 	"go.step.sm/crypto/x509util"
 )
 
@@ -82,19 +83,19 @@ type emailOnlyIdentity string
 func (e emailOnlyIdentity) Valid(req *x509.CertificateRequest) error {
 	switch {
 	case len(req.DNSNames) > 0:
-		return errors.New("certificate request cannot contain DNS names")
+		return errs.Forbidden("certificate request cannot contain DNS names")
 	case len(req.IPAddresses) > 0:
-		return errors.New("certificate request cannot contain IP addresses")
+		return errs.Forbidden("certificate request cannot contain IP addresses")
 	case len(req.URIs) > 0:
-		return errors.New("certificate request cannot contain URIs")
+		return errs.Forbidden("certificate request cannot contain URIs")
 	case len(req.EmailAddresses) == 0:
-		return errors.New("certificate request does not contain any email address")
+		return errs.Forbidden("certificate request does not contain any email address")
 	case len(req.EmailAddresses) > 1:
-		return errors.New("certificate request contains too many email addresses")
+		return errs.Forbidden("certificate request contains too many email addresses")
 	case req.EmailAddresses[0] == "":
-		return errors.New("certificate request cannot contain an empty email address")
+		return errs.Forbidden("certificate request cannot contain an empty email address")
 	case req.EmailAddresses[0] != string(e):
-		return errors.Errorf("certificate request does not contain the valid email address, got %s, want %s", req.EmailAddresses[0], e)
+		return errs.Forbidden("certificate request does not contain the valid email address - got %s, want %s", req.EmailAddresses[0], e)
 	default:
 		return nil
 	}
@@ -107,12 +108,44 @@ type defaultPublicKeyValidator struct{}
 func (v defaultPublicKeyValidator) Valid(req *x509.CertificateRequest) error {
 	switch k := req.PublicKey.(type) {
 	case *rsa.PublicKey:
-		if k.Size() < 256 {
-			return errors.New("rsa key in CSR must be at least 2048 bits (256 bytes)")
+		if k.Size() < keyutil.MinRSAKeyBytes {
+			return errs.Forbidden("certificate request RSA key must be at least %d bits (%d bytes)",
+				8*keyutil.MinRSAKeyBytes, keyutil.MinRSAKeyBytes)
 		}
 	case *ecdsa.PublicKey, ed25519.PublicKey:
 	default:
-		return errors.Errorf("unrecognized public key of type '%T' in CSR", k)
+		return errs.BadRequest("certificate request key of type '%T' is not supported", k)
+	}
+	return nil
+}
+
+// publicKeyMinimumLengthValidator validates the length (in bits) of the public key
+// of a certificate request is at least a certain length
+type publicKeyMinimumLengthValidator struct {
+	length int
+}
+
+// newPublicKeyMinimumLengthValidator creates a new publicKeyMinimumLengthValidator
+// with the given length as its minimum value
+// TODO: change the defaultPublicKeyValidator to have a configurable length instead?
+func newPublicKeyMinimumLengthValidator(length int) publicKeyMinimumLengthValidator {
+	return publicKeyMinimumLengthValidator{
+		length: length,
+	}
+}
+
+// Valid checks that certificate request common name matches the one configured.
+func (v publicKeyMinimumLengthValidator) Valid(req *x509.CertificateRequest) error {
+	switch k := req.PublicKey.(type) {
+	case *rsa.PublicKey:
+		minimumLengthInBytes := v.length / 8
+		if k.Size() < minimumLengthInBytes {
+			return errs.Forbidden("certificate request RSA key must be at least %d bits (%d bytes)",
+				v.length, minimumLengthInBytes)
+		}
+	case *ecdsa.PublicKey, ed25519.PublicKey:
+	default:
+		return errs.BadRequest("certificate request key of type '%T' is not supported", k)
 	}
 	return nil
 }
@@ -127,7 +160,7 @@ func (v commonNameValidator) Valid(req *x509.CertificateRequest) error {
 		return nil
 	}
 	if req.Subject.CommonName != string(v) {
-		return errors.Errorf("certificate request does not contain the valid common name; requested common name = %s, token subject = %s", req.Subject.CommonName, v)
+		return errs.Forbidden("certificate request does not contain the valid common name - got %s, want %s", req.Subject.CommonName, v)
 	}
 	return nil
 }
@@ -145,7 +178,7 @@ func (v commonNameSliceValidator) Valid(req *x509.CertificateRequest) error {
 			return nil
 		}
 	}
-	return errors.Errorf("certificate request does not contain the valid common name, got %s, want %s", req.Subject.CommonName, v)
+	return errs.Forbidden("certificate request does not contain the valid common name - got %s, want %s", req.Subject.CommonName, v)
 }
 
 // dnsNamesValidator validates the DNS names SAN of a certificate request.
@@ -154,6 +187,9 @@ type dnsNamesValidator []string
 // Valid checks that certificate request DNS Names match those configured in
 // the bootstrap (token) flow.
 func (v dnsNamesValidator) Valid(req *x509.CertificateRequest) error {
+	if len(req.DNSNames) == 0 {
+		return nil
+	}
 	want := make(map[string]bool)
 	for _, s := range v {
 		want[s] = true
@@ -163,7 +199,7 @@ func (v dnsNamesValidator) Valid(req *x509.CertificateRequest) error {
 		got[s] = true
 	}
 	if !reflect.DeepEqual(want, got) {
-		return errors.Errorf("certificate request does not contain the valid DNS names - got %v, want %v", req.DNSNames, v)
+		return errs.Forbidden("certificate request does not contain the valid DNS names - got %v, want %v", req.DNSNames, v)
 	}
 	return nil
 }
@@ -174,6 +210,9 @@ type ipAddressesValidator []net.IP
 // Valid checks that certificate request IP Addresses match those configured in
 // the bootstrap (token) flow.
 func (v ipAddressesValidator) Valid(req *x509.CertificateRequest) error {
+	if len(req.IPAddresses) == 0 {
+		return nil
+	}
 	want := make(map[string]bool)
 	for _, ip := range v {
 		want[ip.String()] = true
@@ -183,7 +222,7 @@ func (v ipAddressesValidator) Valid(req *x509.CertificateRequest) error {
 		got[ip.String()] = true
 	}
 	if !reflect.DeepEqual(want, got) {
-		return errors.Errorf("IP Addresses claim failed - got %v, want %v", req.IPAddresses, v)
+		return errs.Forbidden("certificate request does not contain the valid IP addresses - got %v, want %v", req.IPAddresses, v)
 	}
 	return nil
 }
@@ -194,6 +233,9 @@ type emailAddressesValidator []string
 // Valid checks that certificate request IP Addresses match those configured in
 // the bootstrap (token) flow.
 func (v emailAddressesValidator) Valid(req *x509.CertificateRequest) error {
+	if len(req.EmailAddresses) == 0 {
+		return nil
+	}
 	want := make(map[string]bool)
 	for _, s := range v {
 		want[s] = true
@@ -203,7 +245,7 @@ func (v emailAddressesValidator) Valid(req *x509.CertificateRequest) error {
 		got[s] = true
 	}
 	if !reflect.DeepEqual(want, got) {
-		return errors.Errorf("certificate request does not contain the valid Email Addresses - got %v, want %v", req.EmailAddresses, v)
+		return errs.Forbidden("certificate request does not contain the valid email addresses - got %v, want %v", req.EmailAddresses, v)
 	}
 	return nil
 }
@@ -214,6 +256,9 @@ type urisValidator []*url.URL
 // Valid checks that certificate request IP Addresses match those configured in
 // the bootstrap (token) flow.
 func (v urisValidator) Valid(req *x509.CertificateRequest) error {
+	if len(req.URIs) == 0 {
+		return nil
+	}
 	want := make(map[string]bool)
 	for _, u := range v {
 		want[u.String()] = true
@@ -223,7 +268,7 @@ func (v urisValidator) Valid(req *x509.CertificateRequest) error {
 		got[u.String()] = true
 	}
 	if !reflect.DeepEqual(want, got) {
-		return errors.Errorf("URIs claim failed - got %v, want %v", req.URIs, v)
+		return errs.Forbidden("certificate request does not contain the valid URIs - got %v, want %v", req.URIs, v)
 	}
 	return nil
 }
@@ -291,15 +336,15 @@ func (v profileLimitDuration) Modify(cert *x509.Certificate, so SignOptions) err
 		backdate = -1 * so.Backdate
 	}
 	if notBefore.Before(v.notBefore) {
-		return errors.Errorf("requested certificate notBefore (%s) is before "+
-			"the active validity window of the provisioning credential (%s)",
+		return errs.Forbidden(
+			"requested certificate notBefore (%s) is before the active validity window of the provisioning credential (%s)",
 			notBefore, v.notBefore)
 	}
 
 	notAfter := so.NotAfter.RelativeTime(notBefore)
 	if notAfter.After(v.notAfter) {
-		return errors.Errorf("requested certificate notAfter (%s) is after "+
-			"the expiration of the provisioning credential (%s)",
+		return errs.Forbidden(
+			"requested certificate notAfter (%s) is after the expiration of the provisioning credential (%s)",
 			notAfter, v.notAfter)
 	}
 	if notAfter.IsZero() {
@@ -328,7 +373,7 @@ func newValidityValidator(min, max time.Duration) *validityValidator {
 }
 
 // Valid validates the certificate validity settings (notBefore/notAfter) and
-// and total duration.
+// total duration.
 func (v *validityValidator) Valid(cert *x509.Certificate, o SignOptions) error {
 	var (
 		na  = cert.NotAfter.Truncate(time.Second)
@@ -339,37 +384,30 @@ func (v *validityValidator) Valid(cert *x509.Certificate, o SignOptions) error {
 	d := na.Sub(nb)
 
 	if na.Before(now) {
-		return errors.Errorf("notAfter cannot be in the past; na=%v", na)
+		return errs.BadRequest("notAfter cannot be in the past; na=%v", na)
 	}
 	if na.Before(nb) {
-		return errors.Errorf("notAfter cannot be before notBefore; na=%v, nb=%v", na, nb)
+		return errs.BadRequest("notAfter cannot be before notBefore; na=%v, nb=%v", na, nb)
 	}
 	if d < v.min {
-		return errors.Errorf("requested duration of %v is less than the authorized minimum certificate duration of %v",
-			d, v.min)
+		return errs.Forbidden("requested duration of %v is less than the authorized minimum certificate duration of %v", d, v.min)
 	}
 	// NOTE: this check is not "technically correct". We're allowing the max
 	// duration of a cert to be "max + backdate" and not all certificates will
 	// be backdated (e.g. if a user passes the NotBefore value then we do not
 	// apply a backdate). This is good enough.
 	if d > v.max+o.Backdate {
-		return errors.Errorf("requested duration of %v is more than the authorized maximum certificate duration of %v",
-			d, v.max+o.Backdate)
+		return errs.Forbidden("requested duration of %v is more than the authorized maximum certificate duration of %v", d, v.max+o.Backdate)
 	}
 	return nil
 }
 
-var (
-	stepOIDRoot        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 37476, 9000, 64}
-	stepOIDProvisioner = append(asn1.ObjectIdentifier(nil), append(stepOIDRoot, 1)...)
-)
-
-type stepProvisionerASN1 struct {
-	Type          int
-	Name          []byte
-	CredentialID  []byte
-	KeyValuePairs []string `asn1:"optional,omitempty"`
-}
+// type stepProvisionerASN1 struct {
+// 	Type          int
+// 	Name          []byte
+// 	CredentialID  []byte
+// 	KeyValuePairs []string `asn1:"optional,omitempty"`
+// }
 
 type forceCNOption struct {
 	ForceCN bool
@@ -381,41 +419,39 @@ func newForceCNOption(forceCN bool) *forceCNOption {
 
 func (o *forceCNOption) Modify(cert *x509.Certificate, _ SignOptions) error {
 	if !o.ForceCN {
-		// Forcing CN is disabled, do nothing to certificate
 		return nil
 	}
 
+	// Force the common name to be the first DNS if not provided.
 	if cert.Subject.CommonName == "" {
-		if len(cert.DNSNames) > 0 {
-			cert.Subject.CommonName = cert.DNSNames[0]
-		} else {
-			return errors.New("Cannot force CN, DNSNames is empty")
+		if len(cert.DNSNames) == 0 {
+			return errs.BadRequest("cannot force common name, DNS names is empty")
 		}
+		cert.Subject.CommonName = cert.DNSNames[0]
 	}
 
 	return nil
 }
 
 type provisionerExtensionOption struct {
-	Type          int
-	Name          string
-	CredentialID  string
-	KeyValuePairs []string
+	Extension
 }
 
 func newProvisionerExtensionOption(typ Type, name, credentialID string, keyValuePairs ...string) *provisionerExtensionOption {
 	return &provisionerExtensionOption{
-		Type:          int(typ),
-		Name:          name,
-		CredentialID:  credentialID,
-		KeyValuePairs: keyValuePairs,
+		Extension: Extension{
+			Type:          typ,
+			Name:          name,
+			CredentialID:  credentialID,
+			KeyValuePairs: keyValuePairs,
+		},
 	}
 }
 
 func (o *provisionerExtensionOption) Modify(cert *x509.Certificate, _ SignOptions) error {
-	ext, err := createProvisionerExtension(o.Type, o.Name, o.CredentialID, o.KeyValuePairs...)
+	ext, err := o.ToExtension()
 	if err != nil {
-		return err
+		return errs.NewError(http.StatusInternalServerError, err, "error creating certificate")
 	}
 	// Prepend the provisioner extension. In the auth.Sign code we will
 	// force the resulting certificate to only have one extension, the
@@ -426,21 +462,4 @@ func (o *provisionerExtensionOption) Modify(cert *x509.Certificate, _ SignOption
 	// contain the malicious extension, rather than the one applied by step-ca.
 	cert.ExtraExtensions = append([]pkix.Extension{ext}, cert.ExtraExtensions...)
 	return nil
-}
-
-func createProvisionerExtension(typ int, name, credentialID string, keyValuePairs ...string) (pkix.Extension, error) {
-	b, err := asn1.Marshal(stepProvisionerASN1{
-		Type:          typ,
-		Name:          []byte(name),
-		CredentialID:  []byte(credentialID),
-		KeyValuePairs: keyValuePairs,
-	})
-	if err != nil {
-		return pkix.Extension{}, errors.Wrapf(err, "error marshaling provisioner extension")
-	}
-	return pkix.Extension{
-		Id:       stepOIDProvisioner,
-		Critical: false,
-		Value:    b,
-	}, nil
 }

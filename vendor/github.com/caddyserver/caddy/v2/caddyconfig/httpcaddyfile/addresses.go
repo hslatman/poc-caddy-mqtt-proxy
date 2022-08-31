@@ -102,12 +102,20 @@ func (st *ServerType) mapAddressToServerBlocks(originalServerBlocks []serverBloc
 			}
 		}
 
+		// make a slice of the map keys so we can iterate in sorted order
+		addrs := make([]string, 0, len(addrToKeys))
+		for k := range addrToKeys {
+			addrs = append(addrs, k)
+		}
+		sort.Strings(addrs)
+
 		// now that we know which addresses serve which keys of this
 		// server block, we iterate that mapping and create a list of
 		// new server blocks for each address where the keys of the
 		// server block are only the ones which use the address; but
 		// the contents (tokens) are of course the same
-		for addr, keys := range addrToKeys {
+		for _, addr := range addrs {
+			keys := addrToKeys[addr]
 			// parse keys so that we only have to do it once
 			parsedKeys := make([]Address, 0, len(keys))
 			for _, key := range keys {
@@ -161,6 +169,7 @@ func (st *ServerType) consolidateAddrMappings(addrToServerBlocks map[string][]se
 				delete(addrToServerBlocks, otherAddr)
 			}
 		}
+		sort.Strings(a.addresses)
 
 		sbaddrs = append(sbaddrs, a)
 	}
@@ -208,12 +217,16 @@ func (st *ServerType) listenerAddrsForServerBlockKey(sblock serverBlock, key str
 	}
 
 	// the bind directive specifies hosts, but is optional
-	lnHosts := make([]string, 0, len(sblock.pile))
+	lnHosts := make([]string, 0, len(sblock.pile["bind"]))
 	for _, cfgVal := range sblock.pile["bind"] {
 		lnHosts = append(lnHosts, cfgVal.Value.([]string)...)
 	}
 	if len(lnHosts) == 0 {
-		lnHosts = []string{""}
+		if defaultBind, ok := options["default_bind"].([]string); ok {
+			lnHosts = defaultBind
+		} else {
+			lnHosts = []string{""}
+		}
 	}
 
 	// use a map to prevent duplication
@@ -223,7 +236,7 @@ func (st *ServerType) listenerAddrsForServerBlockKey(sblock serverBlock, key str
 		if err == nil && addr.IsUnixNetwork() {
 			listeners[host] = struct{}{}
 		} else {
-			listeners[net.JoinHostPort(host, lnPort)] = struct{}{}
+			listeners[host+":"+lnPort] = struct{}{}
 		}
 	}
 
@@ -232,6 +245,7 @@ func (st *ServerType) listenerAddrsForServerBlockKey(sblock serverBlock, key str
 	for lnStr := range listeners {
 		listenersList = append(listenersList, lnStr)
 	}
+	sort.Strings(listenersList)
 
 	return listenersList, nil
 }
@@ -337,7 +351,9 @@ func (a Address) Normalize() Address {
 	// ensure host is normalized if it's an IP address
 	host := strings.TrimSpace(a.Host)
 	if ip := net.ParseIP(host); ip != nil {
-		host = ip.String()
+		if ipv6 := ip.To16(); ipv6 != nil && ipv6.DefaultMask() == nil {
+			host = ipv6.String()
+		}
 	}
 
 	return Address{
@@ -347,28 +363,6 @@ func (a Address) Normalize() Address {
 		Port:     a.Port,
 		Path:     path,
 	}
-}
-
-// Key returns a string form of a, much like String() does, but this
-// method doesn't add anything default that wasn't in the original.
-func (a Address) Key() string {
-	res := ""
-	if a.Scheme != "" {
-		res += a.Scheme + "://"
-	}
-	if a.Host != "" {
-		res += a.Host
-	}
-	// insert port only if the original has its own explicit port
-	if a.Port != "" &&
-		len(a.Original) >= len(res) &&
-		strings.HasPrefix(a.Original[len(res):], ":"+a.Port) {
-		res += ":" + a.Port
-	}
-	if a.Path != "" {
-		res += a.Path
-	}
-	return res
 }
 
 // lowerExceptPlaceholders lowercases s except within

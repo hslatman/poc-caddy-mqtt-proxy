@@ -54,14 +54,14 @@ member
     : primary                                                       # PrimaryExpr
     | member op='.' id=IDENTIFIER (open='(' args=exprList? ')')?    # SelectOrCall
     | member op='[' index=expr ']'                                  # Index
-    | member op='{' entries=fieldInitializerList? '}'               # CreateMessage
+    | member op='{' entries=fieldInitializerList? ','? '}'          # CreateMessage
     ;
 
 primary
     : leadingDot='.'? id=IDENTIFIER (op='(' args=exprList? ')')?    # IdentOrGlobalCall
     | '(' e=expr ')'                                                # Nested
     | op='[' elems=exprList? ','? ']'                               # CreateList
-    | op='{' entries=mapInitializerList? '}'                        # CreateStruct
+    | op='{' entries=mapInitializerList? ','? '}'                   # CreateStruct
     | literal                                                       # ConstantLiteral
     ;
 
@@ -83,9 +83,9 @@ literal
     | sign=MINUS? tok=NUM_FLOAT # Double
     | tok=STRING    # String
     | tok=BYTES     # Bytes
-    | tok='true'    # BoolTrue
-    | tok='false'   # BoolFalse
-    | tok='null'    # Null
+    | tok=CEL_TRUE   # BoolTrue
+    | tok=CEL_FALSE  # BoolFalse
+    | tok=NUL        # Null
     ;
 
 // Lexer Rules
@@ -117,9 +117,9 @@ PLUS : '+';
 STAR : '*';
 SLASH : '/';
 PERCENT : '%';
-TRUE : 'true';
-FALSE : 'false';
-NULL : 'null';
+CEL_TRUE : 'true';
+CEL_FALSE : 'false';
+NUL : 'null';
 
 fragment BACKSLASH : '\\';
 fragment LETTER : 'A'..'Z' | 'a'..'z' ;

@@ -55,8 +55,9 @@ type updatableAEAD struct {
 
 	rttStats *utils.RTTStats
 
-	tracer logging.ConnectionTracer
-	logger utils.Logger
+	tracer  logging.ConnectionTracer
+	logger  utils.Logger
+	version protocol.VersionNumber
 
 	// use a single slice to avoid allocations
 	nonceBuf []byte
@@ -67,7 +68,7 @@ var (
 	_ ShortHeaderSealer = &updatableAEAD{}
 )
 
-func newUpdatableAEAD(rttStats *utils.RTTStats, tracer logging.ConnectionTracer, logger utils.Logger) *updatableAEAD {
+func newUpdatableAEAD(rttStats *utils.RTTStats, tracer logging.ConnectionTracer, logger utils.Logger, version protocol.VersionNumber) *updatableAEAD {
 	return &updatableAEAD{
 		firstPacketNumber:       protocol.InvalidPacketNumber,
 		largestAcked:            protocol.InvalidPacketNumber,
@@ -77,6 +78,7 @@ func newUpdatableAEAD(rttStats *utils.RTTStats, tracer logging.ConnectionTracer,
 		rttStats:                rttStats,
 		tracer:                  tracer,
 		logger:                  logger,
+		version:                 version,
 	}
 }
 
@@ -100,8 +102,8 @@ func (a *updatableAEAD) rollKeys() {
 
 	a.nextRcvTrafficSecret = a.getNextTrafficSecret(a.suite.Hash, a.nextRcvTrafficSecret)
 	a.nextSendTrafficSecret = a.getNextTrafficSecret(a.suite.Hash, a.nextSendTrafficSecret)
-	a.nextRcvAEAD = createAEAD(a.suite, a.nextRcvTrafficSecret)
-	a.nextSendAEAD = createAEAD(a.suite, a.nextSendTrafficSecret)
+	a.nextRcvAEAD = createAEAD(a.suite, a.nextRcvTrafficSecret, a.version)
+	a.nextSendAEAD = createAEAD(a.suite, a.nextSendTrafficSecret, a.version)
 }
 
 func (a *updatableAEAD) startKeyDropTimer(now time.Time) {
@@ -117,27 +119,27 @@ func (a *updatableAEAD) getNextTrafficSecret(hash crypto.Hash, ts []byte) []byte
 // For the client, this function is called before SetWriteKey.
 // For the server, this function is called after SetWriteKey.
 func (a *updatableAEAD) SetReadKey(suite *qtls.CipherSuiteTLS13, trafficSecret []byte) {
-	a.rcvAEAD = createAEAD(suite, trafficSecret)
-	a.headerDecrypter = newHeaderProtector(suite, trafficSecret, false)
+	a.rcvAEAD = createAEAD(suite, trafficSecret, a.version)
+	a.headerDecrypter = newHeaderProtector(suite, trafficSecret, false, a.version)
 	if a.suite == nil {
 		a.setAEADParameters(a.rcvAEAD, suite)
 	}
 
 	a.nextRcvTrafficSecret = a.getNextTrafficSecret(suite.Hash, trafficSecret)
-	a.nextRcvAEAD = createAEAD(suite, a.nextRcvTrafficSecret)
+	a.nextRcvAEAD = createAEAD(suite, a.nextRcvTrafficSecret, a.version)
 }
 
 // For the client, this function is called after SetReadKey.
 // For the server, this function is called before SetWriteKey.
 func (a *updatableAEAD) SetWriteKey(suite *qtls.CipherSuiteTLS13, trafficSecret []byte) {
-	a.sendAEAD = createAEAD(suite, trafficSecret)
-	a.headerEncrypter = newHeaderProtector(suite, trafficSecret, false)
+	a.sendAEAD = createAEAD(suite, trafficSecret, a.version)
+	a.headerEncrypter = newHeaderProtector(suite, trafficSecret, false, a.version)
 	if a.suite == nil {
 		a.setAEADParameters(a.sendAEAD, suite)
 	}
 
 	a.nextSendTrafficSecret = a.getNextTrafficSecret(suite.Hash, trafficSecret)
-	a.nextSendAEAD = createAEAD(suite, a.nextSendTrafficSecret)
+	a.nextSendAEAD = createAEAD(suite, a.nextSendTrafficSecret, a.version)
 }
 
 func (a *updatableAEAD) setAEADParameters(aead cipher.AEAD, suite *qtls.CipherSuiteTLS13) {
@@ -163,7 +165,7 @@ func (a *updatableAEAD) Open(dst, src []byte, rcvTime time.Time, pn protocol.Pac
 	if err == ErrDecryptionFailed {
 		a.invalidPacketCount++
 		if a.invalidPacketCount >= a.invalidPacketLimit {
-			return nil, qerr.AEADLimitReached
+			return nil, &qerr.TransportError{ErrorCode: qerr.AEADLimitReached}
 		}
 	}
 	if err == nil {
@@ -201,7 +203,10 @@ func (a *updatableAEAD) open(dst, src []byte, rcvTime time.Time, pn protocol.Pac
 		}
 		// Opening succeeded. Check if the peer was allowed to update.
 		if a.keyPhase > 0 && a.firstSentWithCurrentKey == protocol.InvalidPacketNumber {
-			return nil, qerr.NewError(qerr.KeyUpdateError, "keys updated too quickly")
+			return nil, &qerr.TransportError{
+				ErrorCode:    qerr.KeyUpdateError,
+				ErrorMessage: "keys updated too quickly",
+			}
 		}
 		a.rollKeys()
 		a.logger.Debugf("Peer updated keys to %d", a.keyPhase)
@@ -250,7 +255,10 @@ func (a *updatableAEAD) Seal(dst, src []byte, pn protocol.PacketNumber, ad []byt
 func (a *updatableAEAD) SetLargestAcked(pn protocol.PacketNumber) error {
 	if a.firstSentWithCurrentKey != protocol.InvalidPacketNumber &&
 		pn >= a.firstSentWithCurrentKey && a.numRcvdWithCurrentKey == 0 {
-		return qerr.NewError(qerr.KeyUpdateError, fmt.Sprintf("received ACK for key phase %d, but peer didn't update keys", a.keyPhase))
+		return &qerr.TransportError{
+			ErrorCode:    qerr.KeyUpdateError,
+			ErrorMessage: fmt.Sprintf("received ACK for key phase %d, but peer didn't update keys", a.keyPhase),
+		}
 	}
 	a.largestAcked = pn
 	return nil

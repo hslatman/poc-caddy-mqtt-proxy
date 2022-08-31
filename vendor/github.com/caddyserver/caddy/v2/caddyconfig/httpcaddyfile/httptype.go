@@ -17,7 +17,6 @@ package httpcaddyfile
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"reflect"
 	"regexp"
 	"sort"
@@ -30,6 +29,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddypki"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
+	"go.uber.org/zap"
 )
 
 func init() {
@@ -88,32 +88,10 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		return nil, warnings, err
 	}
 
-	// replace shorthand placeholders (which are
-	// convenient when writing a Caddyfile) with
-	// their actual placeholder identifiers or
-	// variable names
-	replacer := strings.NewReplacer(
-		"{dir}", "{http.request.uri.path.dir}",
-		"{file}", "{http.request.uri.path.file}",
-		"{host}", "{http.request.host}",
-		"{hostport}", "{http.request.hostport}",
-		"{port}", "{http.request.port}",
-		"{method}", "{http.request.method}",
-		"{path}", "{http.request.uri.path}",
-		"{query}", "{http.request.uri.query}",
-		"{remote}", "{http.request.remote}",
-		"{remote_host}", "{http.request.remote.host}",
-		"{remote_port}", "{http.request.remote.port}",
-		"{scheme}", "{http.request.scheme}",
-		"{uri}", "{http.request.uri}",
-		"{tls_cipher}", "{http.request.tls.cipher_suite}",
-		"{tls_version}", "{http.request.tls.version}",
-		"{tls_client_fingerprint}", "{http.request.tls.client.fingerprint}",
-		"{tls_client_issuer}", "{http.request.tls.client.issuer}",
-		"{tls_client_serial}", "{http.request.tls.client.serial}",
-		"{tls_client_subject}", "{http.request.tls.client.subject}",
-		"{tls_client_certificate_pem}", "{http.request.tls.client.certificate_pem}",
-	)
+	// replace shorthand placeholders (which are convenient
+	// when writing a Caddyfile) with their actual placeholder
+	// identifiers or variable names
+	replacer := strings.NewReplacer(placeholderShorthands()...)
 
 	// these are placeholders that allow a user-defined final
 	// parameters, but we still want to provide a shorthand
@@ -127,6 +105,9 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		{regexp.MustCompile(`{header\.([\w-]*)}`), "{http.request.header.$1}"},
 		{regexp.MustCompile(`{path\.([\w-]*)}`), "{http.request.uri.path.$1}"},
 		{regexp.MustCompile(`{re\.([\w-]*)\.([\w-]*)}`), "{http.regexp.$1.$2}"},
+		{regexp.MustCompile(`{vars\.([\w-]*)}`), "{http.vars.$1}"},
+		{regexp.MustCompile(`{rp\.([\w-\.]*)}`), "{http.reverse_proxy.$1}"},
+		{regexp.MustCompile(`{err\.([\w-\.]*)}`), "{http.error.$1}"},
 	}
 
 	for _, sb := range originalServerBlocks {
@@ -169,7 +150,11 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 			dirFunc, ok := registeredDirectives[dir]
 			if !ok {
 				tkn := segment[0]
-				return nil, warnings, fmt.Errorf("%s:%d: unrecognized directive: %s", tkn.File, tkn.Line, dir)
+				message := "%s:%d: unrecognized directive: %s"
+				if !sb.block.HasBraces {
+					message += "\nDid you mean to define a second site? If so, you must use curly braces around each site to separate their configurations."
+				}
+				return nil, warnings, fmt.Errorf(message, tkn.File, tkn.Line, dir)
 			}
 
 			h := Helper{
@@ -187,13 +172,7 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 				return nil, warnings, fmt.Errorf("parsing caddyfile tokens for '%s': %v", dir, err)
 			}
 
-			// As a special case, we want "handle_path" to be sorted
-			// at the same level as "handle", so we force them to use
-			// the same directive name after their parsing is complete.
-			// See https://github.com/caddyserver/caddy/issues/3675#issuecomment-678042377
-			if dir == "handle_path" {
-				dir = "handle"
-			}
+			dir = normalizeDirectiveName(dir)
 
 			for _, result := range results {
 				result.directive = dir
@@ -220,9 +199,10 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 
 	// now that each server is configured, make the HTTP app
 	httpApp := caddyhttp.App{
-		HTTPPort:  tryInt(options["http_port"], &warnings),
-		HTTPSPort: tryInt(options["https_port"], &warnings),
-		Servers:   servers,
+		HTTPPort:    tryInt(options["http_port"], &warnings),
+		HTTPSPort:   tryInt(options["https_port"], &warnings),
+		GracePeriod: tryDuration(options["grace_period"], &warnings),
+		Servers:     servers,
 	}
 
 	// then make the TLS app
@@ -252,18 +232,11 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 		}
 		customLogs = append(customLogs, ncl)
 	}
+
 	// Apply global log options, when set
 	if options["log"] != nil {
 		for _, logValue := range options["log"].([]ConfigValue) {
 			addCustomLog(logValue.Value.(namedCustomLog))
-		}
-	}
-	// Apply server-specific log options
-	for _, p := range pairings {
-		for _, sb := range p.serverBlocks {
-			for _, clVal := range sb.pile["custom_log"] {
-				addCustomLog(clVal.Value.(namedCustomLog))
-			}
 		}
 	}
 
@@ -275,6 +248,15 @@ func (st ServerType) Setup(inputServerBlocks []caddyfile.ServerBlock,
 				name: "default",
 				log:  &caddy.CustomLog{Level: "DEBUG"},
 			})
+		}
+	}
+
+	// Apply server-specific log options
+	for _, p := range pairings {
+		for _, sb := range p.serverBlocks {
+			for _, clVal := range sb.pile["custom_log"] {
+				addCustomLog(clVal.Value.(namedCustomLog))
+			}
 		}
 	}
 
@@ -445,11 +427,26 @@ func (st *ServerType) serversFromPairings(
 		// handle the auto_https global option
 		if autoHTTPS != "on" {
 			srv.AutoHTTPS = new(caddyhttp.AutoHTTPSConfig)
-			if autoHTTPS == "off" {
+			switch autoHTTPS {
+			case "off":
 				srv.AutoHTTPS.Disabled = true
-			}
-			if autoHTTPS == "disable_redirects" {
+			case "disable_redirects":
 				srv.AutoHTTPS.DisableRedir = true
+			case "disable_certs":
+				srv.AutoHTTPS.DisableCerts = true
+			case "ignore_loaded_certs":
+				srv.AutoHTTPS.IgnoreLoadedCerts = true
+			}
+		}
+
+		// Using paths in site addresses is deprecated
+		// See ParseAddress() where parsing should later reject paths
+		// See https://github.com/caddyserver/caddy/pull/4728 for a full explanation
+		for _, sblock := range p.serverBlocks {
+			for _, addr := range sblock.keys {
+				if addr.Path != "" {
+					caddy.Log().Named("caddyfile").Warn("Using a path in a site address is deprecated; please use the 'handle' directive instead", zap.String("address", addr.String()))
+				}
 			}
 		}
 
@@ -518,6 +515,16 @@ func (st *ServerType) serversFromPairings(
 			}
 		}
 
+		// if needed, the ServerLogConfig is initialized beforehand so
+		// that all server blocks can populate it with data, even when not
+		// coming with a log directive
+		for _, sblock := range p.serverBlocks {
+			if len(sblock.pile["custom_log"]) != 0 {
+				srv.Logs = new(caddyhttp.ServerLogConfig)
+				break
+			}
+		}
+
 		// create a subroute for each site in the server block
 		for _, sblock := range p.serverBlocks {
 			matcherSetsEnc, err := st.compileEncodedMatcherSets(sblock)
@@ -530,7 +537,7 @@ func (st *ServerType) serversFromPairings(
 			// emit warnings if user put unspecified IP addresses; they probably want the bind directive
 			for _, h := range hosts {
 				if h == "0.0.0.0" || h == "::" {
-					log.Printf("[WARNING] Site block has unspecified IP address %s which only matches requests having that Host header; you probably want the 'bind' directive to configure the socket", h)
+					caddy.Log().Named("caddyfile").Warn("Site block has an unspecified IP address which only matches requests having that Host header; you probably want the 'bind' directive to configure the socket", zap.String("address", h))
 				}
 			}
 
@@ -566,7 +573,7 @@ func (st *ServerType) serversFromPairings(
 			}
 
 			for _, addr := range sblock.keys {
-				// if server only uses HTTPS port, auto-HTTPS will not apply
+				// if server only uses HTTP port, auto-HTTPS will not apply
 				if listenersUseAnyPortOtherThan(srv.Listen, httpPort) {
 					// exclude any hosts that were defined explicitly with "http://"
 					// in the key from automated cert management (issue #2998)
@@ -632,9 +639,6 @@ func (st *ServerType) serversFromPairings(
 			sblockLogHosts := sblock.hostsFromKeys(true)
 			for _, cval := range sblock.pile["custom_log"] {
 				ncl := cval.Value.(namedCustomLog)
-				if srv.Logs == nil {
-					srv.Logs = new(caddyhttp.ServerLogConfig)
-				}
 				if sblock.hasHostCatchAllKey() {
 					// all requests for hosts not able to be listed should use
 					// this log because it's a catch-all-hosts server block
@@ -1044,6 +1048,19 @@ func buildSubroute(routes []ConfigValue, groupCounter counter) (*caddyhttp.Subro
 	return subroute, nil
 }
 
+// normalizeDirectiveName ensures directives that should be sorted
+// at the same level are named the same before sorting happens.
+func normalizeDirectiveName(directive string) string {
+	// As a special case, we want "handle_path" to be sorted
+	// at the same level as "handle", so we force them to use
+	// the same directive name after their parsing is complete.
+	// See https://github.com/caddyserver/caddy/issues/3675#issuecomment-678042377
+	if directive == "handle_path" {
+		directive = "handle"
+	}
+	return directive
+}
+
 // consolidateRoutes combines routes with the same properties
 // (same matchers, same Terminal and Group settings) for a
 // cleaner overall output.
@@ -1225,6 +1242,58 @@ func encodeMatcherSet(matchers map[string]caddyhttp.RequestMatcher) (caddy.Modul
 	return msEncoded, nil
 }
 
+// placeholderShorthands returns a slice of old-new string pairs,
+// where the left of the pair is a placeholder shorthand that may
+// be used in the Caddyfile, and the right is the replacement.
+func placeholderShorthands() []string {
+	return []string{
+		"{dir}", "{http.request.uri.path.dir}",
+		"{file}", "{http.request.uri.path.file}",
+		"{host}", "{http.request.host}",
+		"{hostport}", "{http.request.hostport}",
+		"{port}", "{http.request.port}",
+		"{method}", "{http.request.method}",
+		"{path}", "{http.request.uri.path}",
+		"{query}", "{http.request.uri.query}",
+		"{remote}", "{http.request.remote}",
+		"{remote_host}", "{http.request.remote.host}",
+		"{remote_port}", "{http.request.remote.port}",
+		"{scheme}", "{http.request.scheme}",
+		"{uri}", "{http.request.uri}",
+		"{tls_cipher}", "{http.request.tls.cipher_suite}",
+		"{tls_version}", "{http.request.tls.version}",
+		"{tls_client_fingerprint}", "{http.request.tls.client.fingerprint}",
+		"{tls_client_issuer}", "{http.request.tls.client.issuer}",
+		"{tls_client_serial}", "{http.request.tls.client.serial}",
+		"{tls_client_subject}", "{http.request.tls.client.subject}",
+		"{tls_client_certificate_pem}", "{http.request.tls.client.certificate_pem}",
+		"{tls_client_certificate_der_base64}", "{http.request.tls.client.certificate_der_base64}",
+		"{upstream_hostport}", "{http.reverse_proxy.upstream.hostport}",
+	}
+}
+
+// WasReplacedPlaceholderShorthand checks if a token string was
+// likely a replaced shorthand of the known Caddyfile placeholder
+// replacement outputs. Useful to prevent some user-defined map
+// output destinations from overlapping with one of the
+// predefined shorthands.
+func WasReplacedPlaceholderShorthand(token string) string {
+	prev := ""
+	for i, item := range placeholderShorthands() {
+		// only look at every 2nd item, which is the replacement
+		if i%2 == 0 {
+			prev = item
+			continue
+		}
+		if strings.Trim(token, "{}") == strings.Trim(item, "{}") {
+			// we return the original shorthand so it
+			// can be used for an error message
+			return prev
+		}
+	}
+	return ""
+}
+
 // tryInt tries to convert val to an integer. If it fails,
 // it downgrades the error to a warning and returns 0.
 func tryInt(val interface{}, warnings *[]caddyconfig.Warning) int {
@@ -1241,6 +1310,14 @@ func tryString(val interface{}, warnings *[]caddyconfig.Warning) string {
 		*warnings = append(*warnings, caddyconfig.Warning{Message: "not a string type"})
 	}
 	return stringVal
+}
+
+func tryDuration(val interface{}, warnings *[]caddyconfig.Warning) caddy.Duration {
+	durationVal, ok := val.(caddy.Duration)
+	if val != nil && !ok && warnings != nil {
+		*warnings = append(*warnings, caddyconfig.Warning{Message: "not a duration type"})
+	}
+	return durationVal
 }
 
 // sliceContains returns true if needle is in haystack.

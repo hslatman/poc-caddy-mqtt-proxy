@@ -423,6 +423,17 @@ func (ctx Context) App(name string) (interface{}, error) {
 	return modVal, nil
 }
 
+// AppIsConfigured returns whether an app named name has been
+// configured. Can be called before calling App() to avoid
+// instantiating an empty app when that's not desirable.
+func (ctx Context) AppIsConfigured(name string) bool {
+	if _, ok := ctx.cfg.apps[name]; ok {
+		return true
+	}
+	appRaw := ctx.cfg.AppsRaw[name]
+	return appRaw != nil
+}
+
 // Storage returns the configured Caddy storage implementation.
 func (ctx Context) Storage() certmagic.Storage {
 	return ctx.cfg.storage
@@ -430,5 +441,13 @@ func (ctx Context) Storage() certmagic.Storage {
 
 // Logger returns a logger that can be used by mod.
 func (ctx Context) Logger(mod Module) *zap.Logger {
+	if ctx.cfg == nil {
+		// often the case in tests; just use a dev logger
+		l, err := zap.NewDevelopment()
+		if err != nil {
+			panic("config missing, unable to create dev logger: " + err.Error())
+		}
+		return l
+	}
 	return ctx.cfg.Logging.Logger(mod)
 }

@@ -16,10 +16,12 @@ package templates
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -35,17 +37,19 @@ func init() {
 //
 // ⚠️ Template functions/actions are still experimental, so they are subject to change.
 //
+// Custom template functions can be registered by creating a plugin module under the `http.handlers.templates.functions.*` namespace that implements the `CustomFunctions` interface.
+//
 // [All Sprig functions](https://masterminds.github.io/sprig/) are supported.
 //
-// In addition to the standard functions and Sprig functions, Caddy adds
+// In addition to the standard functions and the Sprig library, Caddy adds
 // extra functions and data that are available to a template:
 //
 // ##### `.Args`
 //
-// Access arguments passed to this page/context, for example as the result of a `include`.
+// A slice of arguments passed to this page/context, for example as the result of a `include`.
 //
 // ```
-// {{.Args 0}} // first argument
+// {{index .Args 0}} // first argument
 // ```
 //
 // ##### `.Cookie`
@@ -90,9 +94,26 @@ func init() {
 // {{httpInclude "/foo/bar?q=val"}}
 // ```
 //
+// ##### `import`
+//
+// Imports the contents of another file and adds any template definitions to the template stack. If there are no defitions, the filepath will be the defition name. Any {{ define }} blocks will be accessible by {{ template }} or {{ block }}. Imports must happen before the template or block action is called
+//
+// **filename.html**
+// ```
+// {{ define "main" }}
+// content
+// {{ end }}
+// ```
+//
+// **index.html**
+// ```
+// {{ import "/path/to/filename.html" }}
+// {{ template "main" }}
+// ```
+//
 // ##### `include`
 //
-// Includes the contents of another file. Optionally can pass key-value pairs as arguments to be accessed by the included file.
+// Includes the contents of another file and renders in-place. Optionally can pass key-value pairs as arguments to be accessed by the included file.
 //
 // ```
 // {{include "path/to/file.html"}}  // no arguments
@@ -109,7 +130,11 @@ func init() {
 //
 // ##### `markdown`
 //
-// Renders the given Markdown text as HTML.
+// Renders the given Markdown text as HTML. This uses the
+// [Goldmark](https://github.com/yuin/goldmark) library,
+// which is CommonMark compliant. It also has these plugins
+// enabled: Github Flavored Markdown, Footnote and syntax
+// highlighting provided by [Chroma](https://github.com/alecthomas/chroma).
 //
 // ```
 // {{markdown "My _markdown_ text"}}
@@ -135,6 +160,10 @@ func init() {
 // ```
 // {{.Req.Header.Get "User-Agent"}}
 // ```
+//
+// ##### `.OriginalReq`
+//
+// Like .Req, except it accesses the original HTTP request before rewrites or other internal modifications.
 //
 // ##### `.RespHeader.Add`
 //
@@ -209,6 +238,29 @@ func init() {
 // {{stripHTML "Shows <b>only</b> text content"}}
 // ```
 //
+// ##### `humanize`
+//
+// Transforms size and time inputs to a human readable format.
+// This uses the [go-humanize](https://github.com/dustin/go-humanize) library.
+//
+// The first argument must be a format type, and the last argument
+// is the input, or the input can be piped in. The supported format
+// types are:
+// - **size** which turns an integer amount of bytes into a string like `2.3 MB`
+// - **time** which turns a time string into a relative time string like `2 weeks ago`
+//
+// For the `time` format, the layout for parsing the input can be configured
+// by appending a colon `:` followed by the desired time layout. You can
+// find the documentation on time layouts [in Go's docs](https://pkg.go.dev/time#pkg-constants).
+// The default time layout is `RFC1123Z`, i.e. `Mon, 02 Jan 2006 15:04:05 -0700`.
+//
+// ```
+// {{humanize "size" "2048000"}}
+// {{placeholder "http.response.header.Content-Length" | humanize "size"}}
+// {{humanize "time" "Fri, 05 May 2022 15:04:05 +0200"}}
+// {{humanize "time:2006-Jan-02" "2022-May-05"}}
+// ```
+
 type Templates struct {
 	// The root path from which to load files. Required if template functions
 	// accessing the file system are used (such as include). Default is
@@ -220,8 +272,17 @@ type Templates struct {
 	// Default is text/plain, text/markdown, and text/html.
 	MIMETypes []string `json:"mime_types,omitempty"`
 
-	// The template action delimiters.
+	// The template action delimiters. If set, must be precisely two elements:
+	// the opening and closing delimiters. Default: `["{{", "}}"]`
 	Delimiters []string `json:"delimiters,omitempty"`
+
+	customFuncs []template.FuncMap
+}
+
+// Customfunctions is the interface for registering custom template functions.
+type CustomFunctions interface {
+	// CustomTemplateFunctions should return the mapping from custom function names to implementations.
+	CustomTemplateFunctions() template.FuncMap
 }
 
 // CaddyModule returns the Caddy module information.
@@ -234,6 +295,18 @@ func (Templates) CaddyModule() caddy.ModuleInfo {
 
 // Provision provisions t.
 func (t *Templates) Provision(ctx caddy.Context) error {
+	fnModInfos := caddy.GetModules("http.handlers.templates.functions")
+	customFuncs := make([]template.FuncMap, len(fnModInfos), 0)
+	for _, modInfo := range fnModInfos {
+		mod := modInfo.New()
+		fnMod, ok := mod.(CustomFunctions)
+		if !ok {
+			return fmt.Errorf("module %q does not satisfy the CustomFunctions interface", modInfo.ID)
+		}
+		customFuncs = append(customFuncs, fnMod.CustomTemplateFunctions())
+	}
+	t.customFuncs = customFuncs
+
 	if t.MIMETypes == nil {
 		t.MIMETypes = defaultMIMETypes
 	}
@@ -303,15 +376,22 @@ func (t *Templates) executeTemplate(rr caddyhttp.ResponseRecorder, r *http.Reque
 		fs = http.Dir(repl.ReplaceAll(t.FileRoot, "."))
 	}
 
-	ctx := &templateContext{
-		Root:       fs,
-		Req:        r,
-		RespHeader: tplWrappedHeader{rr.Header()},
-		config:     t,
+	ctx := &TemplateContext{
+		Root:        fs,
+		Req:         r,
+		RespHeader:  WrappedHeader{rr.Header()},
+		config:      t,
+		CustomFuncs: t.customFuncs,
 	}
 
 	err := ctx.executeTemplateInBuffer(r.URL.Path, rr.Buffer())
 	if err != nil {
+		// templates may return a custom HTTP error to be propagated to the client,
+		// otherwise for any other error we assume the template is broken
+		var handlerErr caddyhttp.HandlerError
+		if errors.As(err, &handlerErr) {
+			return handlerErr
+		}
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
