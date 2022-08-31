@@ -29,10 +29,15 @@ func init() {
 	caddy.RegisterModule(MatchVarsRE{})
 }
 
-// VarsMiddleware is an HTTP middleware which sets variables
-// in the context, mainly for use by placeholders. The
-// placeholders have the form: `{http.vars.variable_name}`
-type VarsMiddleware map[string]string
+// VarsMiddleware is an HTTP middleware which sets variables to
+// have values that can be used in the HTTP request handler
+// chain. The primary way to access variables is with placeholders,
+// which have the form: `{http.vars.variable_name}`, or with
+// the `vars` and `vars_regexp` request matchers.
+//
+// The key is the variable name, and the value is the value of the
+// variable. Both the name and value may use or contain placeholders.
+type VarsMiddleware map[string]interface{}
 
 // CaddyModule returns the Caddy module information.
 func (VarsMiddleware) CaddyModule() caddy.ModuleInfo {
@@ -42,20 +47,77 @@ func (VarsMiddleware) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-func (t VarsMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next Handler) error {
+func (m VarsMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next Handler) error {
 	vars := r.Context().Value(VarsCtxKey).(map[string]interface{})
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	for k, v := range t {
+	for k, v := range m {
 		keyExpanded := repl.ReplaceAll(k, "")
-		valExpanded := repl.ReplaceAll(v, "")
-		vars[keyExpanded] = valExpanded
+		if valStr, ok := v.(string); ok {
+			v = repl.ReplaceAll(valStr, "")
+		}
+		vars[keyExpanded] = v
 	}
 	return next.ServeHTTP(w, r)
 }
 
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler. Syntax:
+//
+//     vars [<name> <val>] {
+//         <name> <val>
+//         ...
+//     }
+//
+func (m *VarsMiddleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	if *m == nil {
+		*m = make(VarsMiddleware)
+	}
+
+	nextVar := func(headerLine bool) error {
+		if headerLine {
+			// header line is optional
+			if !d.NextArg() {
+				return nil
+			}
+		}
+		varName := d.Val()
+
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		varValue := d.ScalarVal()
+
+		(*m)[varName] = varValue
+
+		if d.NextArg() {
+			return d.ArgErr()
+		}
+		return nil
+	}
+
+	for d.Next() {
+		if err := nextVar(true); err != nil {
+			return err
+		}
+		for nesting := d.Nesting(); d.NextBlock(nesting); {
+			if err := nextVar(false); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 // VarsMatcher is an HTTP request matcher which can match
-// requests based on variables in the context.
-type VarsMatcher map[string]string
+// requests based on variables in the context. The key is
+// the name of the variable, and the values are possible
+// values the variable can be in order to match (OR'ed).
+//
+// As a special case, this matcher can also match on
+// placeholders generally. If the key is not an HTTP chain
+// variable, it will be checked to see if it is a
+// placeholder name, and if so, will compare its value.
+type VarsMatcher map[string][]string
 
 // CaddyModule returns the Caddy module information.
 func (VarsMatcher) CaddyModule() caddy.ModuleInfo {
@@ -68,14 +130,18 @@ func (VarsMatcher) CaddyModule() caddy.ModuleInfo {
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *VarsMatcher) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if *m == nil {
-		*m = make(map[string]string)
+		*m = make(map[string][]string)
 	}
 	for d.Next() {
-		var field, val string
-		if !d.Args(&field, &val) {
-			return d.Errf("malformed vars matcher: expected both field and value")
+		var field string
+		if !d.Args(&field) {
+			return d.Errf("malformed vars matcher: expected field name")
 		}
-		(*m)[field] = val
+		vals := d.RemainingArgs()
+		if len(vals) == 0 {
+			return d.Errf("malformed vars matcher: expected at least one value to match against")
+		}
+		(*m)[field] = append((*m)[field], vals...)
 		if d.NextBlock(0) {
 			return d.Err("malformed vars matcher: blocks are not supported")
 		}
@@ -83,29 +149,46 @@ func (m *VarsMatcher) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// Match matches a request based on variables in the context.
+// Match matches a request based on variables in the context,
+// or placeholders if the key is not a variable.
 func (m VarsMatcher) Match(r *http.Request) bool {
+	if len(m) == 0 {
+		return true
+	}
+
 	vars := r.Context().Value(VarsCtxKey).(map[string]interface{})
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	for k, v := range m {
-		keyExpanded := repl.ReplaceAll(k, "")
-		valExpanded := repl.ReplaceAll(v, "")
-		var varStr string
-		switch vv := vars[keyExpanded].(type) {
-		case string:
-			varStr = vv
-		case fmt.Stringer:
-			varStr = vv.String()
-		case error:
-			varStr = vv.Error()
-		default:
-			varStr = fmt.Sprintf("%v", vv)
+
+	for key, vals := range m {
+		// look up the comparison value we will check against with this key
+		matcherVarNameExpanded := repl.ReplaceAll(key, "")
+		varValue, ok := vars[matcherVarNameExpanded]
+		if !ok {
+			// as a special case, if it's not an HTTP variable,
+			// see if it's a placeholder name
+			varValue, _ = repl.Get(matcherVarNameExpanded)
 		}
-		if varStr != valExpanded {
-			return false
+
+		// see if any of the values given in the matcher match the actual value
+		for _, v := range vals {
+			matcherValExpanded := repl.ReplaceAll(v, "")
+			var varStr string
+			switch vv := varValue.(type) {
+			case string:
+				varStr = vv
+			case fmt.Stringer:
+				varStr = vv.String()
+			case error:
+				varStr = vv.Error()
+			default:
+				varStr = fmt.Sprintf("%v", vv)
+			}
+			if varStr == matcherValExpanded {
+				return true
+			}
 		}
 	}
-	return true
+	return false
 }
 
 // MatchVarsRE matches the value of the context variables by a given regular expression.
@@ -228,6 +311,8 @@ func SetVar(ctx context.Context, key string, value interface{}) {
 
 // Interface guards
 var (
-	_ MiddlewareHandler = (*VarsMiddleware)(nil)
-	_ RequestMatcher    = (*VarsMatcher)(nil)
+	_ MiddlewareHandler     = (*VarsMiddleware)(nil)
+	_ caddyfile.Unmarshaler = (*VarsMiddleware)(nil)
+	_ RequestMatcher        = (*VarsMatcher)(nil)
+	_ caddyfile.Unmarshaler = (*VarsMatcher)(nil)
 )

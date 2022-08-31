@@ -42,7 +42,7 @@ const (
 	activeConnectionIDLimitParameterID         transportParameterID = 0xe
 	initialSourceConnectionIDParameterID       transportParameterID = 0xf
 	retrySourceConnectionIDParameterID         transportParameterID = 0x10
-	// https://datatracker.ietf.org/doc/draft-ietf-quic-datagram/
+	// RFC 9221
 	maxDatagramFrameSizeParameterID transportParameterID = 0x20
 )
 
@@ -90,7 +90,10 @@ type TransportParameters struct {
 // Unmarshal the transport parameters
 func (p *TransportParameters) Unmarshal(data []byte, sentBy protocol.Perspective) error {
 	if err := p.unmarshal(bytes.NewReader(data), sentBy, false); err != nil {
-		return qerr.NewError(qerr.TransportParameterError, err.Error())
+		return &qerr.TransportError{
+			ErrorCode:    qerr.TransportParameterError,
+			ErrorMessage: err.Error(),
+		}
 	}
 	return nil
 }
@@ -259,7 +262,7 @@ func (p *TransportParameters) readNumericTransportParameter(
 		return fmt.Errorf("error while reading transport parameter %d: %s", paramID, err)
 	}
 	if remainingLen-r.Len() != expectedLen {
-		return fmt.Errorf("inconsistent transport parameter length for %d", paramID)
+		return fmt.Errorf("inconsistent transport parameter length for transport parameter %#x", paramID)
 	}
 	//nolint:exhaustive // This only covers the numeric transport parameters.
 	switch paramID {

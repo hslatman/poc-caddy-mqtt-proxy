@@ -16,19 +16,28 @@ package caddyhttp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/checker/decls"
+	"github.com/google/cel-go/common/types"
+	"github.com/google/cel-go/common/types/ref"
 	"go.uber.org/zap"
+	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
 type (
@@ -81,10 +90,23 @@ type (
 	// MatchMethod matches requests by the method.
 	MatchMethod []string
 
-	// MatchQuery matches requests by URI's query string.
+	// MatchQuery matches requests by the URI's query string. It takes a JSON object
+	// keyed by the query keys, with an array of string values to match for that key.
+	// Query key matches are exact, but wildcards may be used for value matches. Both
+	// keys and values may be placeholders.
+	// An example of the structure to match `?key=value&topic=api&query=something` is:
+	//
+	// ```json
+	// {
+	// 	"key": ["value"],
+	//	"topic": ["api"],
+	//	"query": ["*"]
+	// }
+	// ```
 	MatchQuery url.Values
 
-	// MatchHeader matches requests by header fields. It performs fast,
+	// MatchHeader matches requests by header fields. The key is the field
+	// name and the array is the list of field values. It performs fast,
 	// exact string comparisons of the field values. Fast prefix, suffix,
 	// and substring matches can also be done by suffixing, prefixing, or
 	// surrounding the value with the wildcard `*` character, respectively.
@@ -101,7 +123,8 @@ type (
 	// (potentially leading to collisions).
 	MatchHeaderRE map[string]*MatchRegexp
 
-	// MatchProtocol matches requests by protocol.
+	// MatchProtocol matches requests by protocol. Recognized values are
+	// "http", "https", and "grpc".
 	MatchProtocol string
 
 	// MatchRemoteIP matches requests by client IP (or CIDR range).
@@ -115,7 +138,10 @@ type (
 		// to spoof request headers. Default: false
 		Forwarded bool `json:"forwarded,omitempty"`
 
+		// cidrs and zones vars should aligned always in the same
+		// length and indexes for matching later
 		cidrs  []*net.IPNet
+		zones  []string
 		logger *zap.Logger
 	}
 
@@ -126,9 +152,9 @@ type (
 	// matchers within a set work the same (i.e. different matchers in
 	// the same set are AND'ed).
 	//
-	// Note that the generated docs which describe the structure of
-	// this module are wrong because of how this type unmarshals JSON
-	// in a custom way. The correct structure is:
+	// NOTE: The generated docs which describe the structure of this
+	// module are wrong because of how this type unmarshals JSON in a
+	// custom way. The correct structure is:
 	//
 	// ```json
 	// [
@@ -272,6 +298,29 @@ outer:
 	return false
 }
 
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression host('localhost')
+func (MatchHost) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		"host",
+		"host_match_request_list",
+		[]*exprpb.Type{CelTypeListString},
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			strList, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			matcher := MatchHost(strList.([]string))
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+}
+
 // fuzzy returns true if the given hostname h is not a specific
 // hostname, e.g. has placeholders or wildcards.
 func (MatchHost) fuzzy(h string) bool { return strings.ContainsAny(h, "{*") }
@@ -299,7 +348,20 @@ func (m MatchPath) Provision(_ caddy.Context) error {
 
 // Match returns true if r matches m.
 func (m MatchPath) Match(r *http.Request) bool {
-	lowerPath := strings.ToLower(r.URL.Path)
+	// PathUnescape returns an error if the escapes aren't
+	// well-formed, meaning the count % matches the RFC.
+	// Return early if the escape is improper.
+	unescapedPath, err := url.PathUnescape(r.URL.Path)
+	if err != nil {
+		return false
+	}
+
+	lowerPath := strings.ToLower(unescapedPath)
+
+	// Clean the path, merges doubled slashes, etc.
+	// This ensures maliciously crafted requests can't bypass
+	// the path matcher. See #4407
+	lowerPath = path.Clean(lowerPath)
 
 	// see #2917; Windows ignores trailing dots and spaces
 	// when accessing files (sigh), potentially causing a
@@ -307,6 +369,11 @@ func (m MatchPath) Match(r *http.Request) bool {
 	// as static files, exposing the source code, instead of
 	// being matched by *.php to be treated as PHP scripts
 	lowerPath = strings.TrimRight(lowerPath, ". ")
+
+	// Cleaning may remove the trailing slash, but we want to keep it
+	if lowerPath != "/" && strings.HasSuffix(r.URL.Path, "/") {
+		lowerPath = lowerPath + "/"
+	}
 
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
@@ -359,6 +426,33 @@ func (m MatchPath) Match(r *http.Request) bool {
 	return false
 }
 
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression path('*substring*', '*suffix')
+func (MatchPath) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		// name of the macro, this is the function name that users see when writing expressions.
+		"path",
+		// name of the function that the macro will be rewritten to call.
+		"path_match_request_list",
+		// internal data type of the MatchPath value.
+		[]*exprpb.Type{CelTypeListString},
+		// function to convert a constant list of strings to a MatchPath instance.
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			strList, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			matcher := MatchPath(strList.([]string))
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+}
+
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (m *MatchPath) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
@@ -381,7 +475,70 @@ func (MatchPathRE) CaddyModule() caddy.ModuleInfo {
 // Match returns true if r matches m.
 func (m MatchPathRE) Match(r *http.Request) bool {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	return m.MatchRegexp.Match(r.URL.Path, repl)
+
+	// PathUnescape returns an error if the escapes aren't
+	// well-formed, meaning the count % matches the RFC.
+	// Return early if the escape is improper.
+	unescapedPath, err := url.PathUnescape(r.URL.Path)
+	if err != nil {
+		return false
+	}
+
+	// Clean the path, merges doubled slashes, etc.
+	// This ensures maliciously crafted requests can't bypass
+	// the path matcher. See #4407
+	cleanedPath := path.Clean(unescapedPath)
+
+	// Cleaning may remove the trailing slash, but we want to keep it
+	if cleanedPath != "/" && strings.HasSuffix(r.URL.Path, "/") {
+		cleanedPath = cleanedPath + "/"
+	}
+
+	return m.MatchRegexp.Match(cleanedPath, repl)
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression path_regexp('^/bar')
+func (MatchPathRE) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	unnamedPattern, err := CELMatcherImpl(
+		"path_regexp",
+		"path_regexp_request_string",
+		[]*exprpb.Type{decls.String},
+		func(data ref.Val) (RequestMatcher, error) {
+			pattern := data.(types.String)
+			matcher := MatchPathRE{MatchRegexp{Pattern: string(pattern)}}
+			err := matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	namedPattern, err := CELMatcherImpl(
+		"path_regexp",
+		"path_regexp_request_string_string",
+		[]*exprpb.Type{decls.String, decls.String},
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			params, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			strParams := params.([]string)
+			matcher := MatchPathRE{MatchRegexp{Name: strParams[0], Pattern: strParams[1]}}
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	envOpts := append(unnamedPattern.CompileOptions(), namedPattern.CompileOptions()...)
+	prgOpts := append(unnamedPattern.ProgramOptions(), namedPattern.ProgramOptions()...)
+	return NewMatcherCELLibrary(envOpts, prgOpts), nil
 }
 
 // CaddyModule returns the Caddy module information.
@@ -411,6 +568,27 @@ func (m MatchMethod) Match(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression method('PUT', 'POST')
+func (MatchMethod) CELLibrary(_ caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		"method",
+		"method_request_list",
+		[]*exprpb.Type{CelTypeListString},
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			strList, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			return MatchMethod(strList.([]string)), nil
+		},
+	)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -460,6 +638,26 @@ func (m MatchQuery) Match(r *http.Request) bool {
 		}
 	}
 	return len(m) == 0 && len(r.URL.Query()) == 0
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression query({'sort': 'asc'}) || query({'foo': ['*bar*', 'baz']})
+func (MatchQuery) CELLibrary(_ caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		"query",
+		"query_matcher_request_map",
+		[]*exprpb.Type{CelTypeJson},
+		func(data ref.Val) (RequestMatcher, error) {
+			mapStrListStr, err := CELValueToMapStrList(data)
+			if err != nil {
+				return nil, err
+			}
+			return MatchQuery(url.Values(mapStrListStr)), nil
+		},
+	)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -515,6 +713,27 @@ func (m *MatchHeader) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 func (m MatchHeader) Match(r *http.Request) bool {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	return matchHeaders(r.Header, http.Header(m), r.Host, repl)
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression header({'content-type': 'image/png'})
+//    expression header({'foo': ['bar', 'baz']}) // match bar or baz
+func (MatchHeader) CELLibrary(_ caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		"header",
+		"header_matcher_request_map",
+		[]*exprpb.Type{CelTypeJson},
+		func(data ref.Val) (RequestMatcher, error) {
+			mapStrListStr, err := CELValueToMapStrList(data)
+			if err != nil {
+				return nil, err
+			}
+			return MatchHeader(http.Header(mapStrListStr)), nil
+		},
+	)
 }
 
 // getHeaderFieldVals returns the field values for the given fieldName from input.
@@ -654,6 +873,57 @@ func (m MatchHeaderRE) Validate() error {
 	return nil
 }
 
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression header_regexp('foo', 'Field', 'fo+')
+func (MatchHeaderRE) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	unnamedPattern, err := CELMatcherImpl(
+		"header_regexp",
+		"header_regexp_request_string_string",
+		[]*exprpb.Type{decls.String, decls.String},
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			params, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			strParams := params.([]string)
+			matcher := MatchHeaderRE{}
+			matcher[strParams[0]] = &MatchRegexp{Pattern: strParams[1], Name: ""}
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	namedPattern, err := CELMatcherImpl(
+		"header_regexp",
+		"header_regexp_request_string_string_string",
+		[]*exprpb.Type{decls.String, decls.String, decls.String},
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			params, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+			strParams := params.([]string)
+			matcher := MatchHeaderRE{}
+			matcher[strParams[1]] = &MatchRegexp{Pattern: strParams[2], Name: strParams[0]}
+			err = matcher.Provision(ctx)
+			return matcher, err
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	envOpts := append(unnamedPattern.CompileOptions(), namedPattern.CompileOptions()...)
+	prgOpts := append(unnamedPattern.ProgramOptions(), namedPattern.ProgramOptions()...)
+	return NewMatcherCELLibrary(envOpts, prgOpts), nil
+}
+
 // CaddyModule returns the Caddy module information.
 func (MatchProtocol) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
@@ -666,7 +936,7 @@ func (MatchProtocol) CaddyModule() caddy.ModuleInfo {
 func (m MatchProtocol) Match(r *http.Request) bool {
 	switch string(m) {
 	case "grpc":
-		return r.Header.Get("content-type") == "application/grpc"
+		return strings.HasPrefix(r.Header.Get("content-type"), "application/grpc")
 	case "https":
 		return r.TLS != nil
 	case "http":
@@ -685,6 +955,26 @@ func (m *MatchProtocol) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		*m = MatchProtocol(proto)
 	}
 	return nil
+}
+
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression protocol('https')
+func (MatchProtocol) CELLibrary(_ caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		"protocol",
+		"protocol_request_string",
+		[]*exprpb.Type{decls.String},
+		func(data ref.Val) (RequestMatcher, error) {
+			protocolStr, ok := data.(types.String)
+			if !ok {
+				return nil, errors.New("protocol argument was not a string")
+			}
+			return MatchProtocol(strings.ToLower(string(protocolStr))), nil
+		},
+	)
 }
 
 // CaddyModule returns the Caddy module information.
@@ -811,6 +1101,17 @@ func (m *MatchRemoteIP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				m.Forwarded = true
 				continue
 			}
+			if d.Val() == "private_ranges" {
+				m.Ranges = append(m.Ranges, []string{
+					"192.168.0.0/16",
+					"172.16.0.0/12",
+					"10.0.0.0/8",
+					"127.0.0.1/8",
+					"fd00::/8",
+					"::1",
+				}...)
+				continue
+			}
 			m.Ranges = append(m.Ranges, d.Val())
 		}
 		if d.NextBlock(0) {
@@ -820,14 +1121,63 @@ func (m *MatchRemoteIP) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression remote_ip('forwarded', '192.168.0.0/16', '172.16.0.0/12', '10.0.0.0/8')
+func (MatchRemoteIP) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	return CELMatcherImpl(
+		// name of the macro, this is the function name that users see when writing expressions.
+		"remote_ip",
+		// name of the function that the macro will be rewritten to call.
+		"remote_ip_match_request_list",
+		// internal data type of the MatchPath value.
+		[]*exprpb.Type{CelTypeListString},
+		// function to convert a constant list of strings to a MatchPath instance.
+		func(data ref.Val) (RequestMatcher, error) {
+			refStringList := reflect.TypeOf([]string{})
+			strList, err := data.ConvertToNative(refStringList)
+			if err != nil {
+				return nil, err
+			}
+
+			m := MatchRemoteIP{}
+
+			for _, input := range strList.([]string) {
+				if input == "forwarded" {
+					if len(m.Ranges) > 0 {
+						return nil, errors.New("if used, 'forwarded' must be first argument")
+					}
+					m.Forwarded = true
+					continue
+				}
+				m.Ranges = append(m.Ranges, input)
+			}
+
+			err = m.Provision(ctx)
+			return m, err
+		},
+	)
+}
+
 // Provision parses m's IP ranges, either from IP or CIDR expressions.
 func (m *MatchRemoteIP) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
 	for _, str := range m.Ranges {
+		// Exclude the zone_id from the IP
+		if strings.Contains(str, "%") {
+			split := strings.Split(str, "%")
+			str = split[0]
+			// write zone identifiers in m.zones for matching later
+			m.zones = append(m.zones, split[1])
+		} else {
+			m.zones = append(m.zones, "")
+		}
 		if strings.Contains(str, "/") {
 			_, ipNet, err := net.ParseCIDR(str)
 			if err != nil {
-				return fmt.Errorf("parsing CIDR expression: %v", err)
+				return fmt.Errorf("parsing CIDR expression '%s': %v", str, err)
 			}
 			m.cidrs = append(m.cidrs, ipNet)
 		} else {
@@ -845,8 +1195,9 @@ func (m *MatchRemoteIP) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (m MatchRemoteIP) getClientIP(r *http.Request) (net.IP, error) {
+func (m MatchRemoteIP) getClientIP(r *http.Request) (net.IP, string, error) {
 	remote := r.RemoteAddr
+	zoneID := ""
 	if m.Forwarded {
 		if fwdFor := r.Header.Get("X-Forwarded-For"); fwdFor != "" {
 			remote = strings.TrimSpace(strings.Split(fwdFor, ",")[0])
@@ -856,24 +1207,39 @@ func (m MatchRemoteIP) getClientIP(r *http.Request) (net.IP, error) {
 	if err != nil {
 		ipStr = remote // OK; probably didn't have a port
 	}
+	// Some IPv6-Adresses can contain zone identifiers at the end,
+	// which are separated with "%"
+	if strings.Contains(ipStr, "%") {
+		split := strings.Split(ipStr, "%")
+		ipStr = split[0]
+		zoneID = split[1]
+	}
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
-		return nil, fmt.Errorf("invalid client IP address: %s", ipStr)
+		return nil, zoneID, fmt.Errorf("invalid client IP address: %s", ipStr)
 	}
-	return ip, nil
+	return ip, zoneID, nil
 }
 
 // Match returns true if r matches m.
 func (m MatchRemoteIP) Match(r *http.Request) bool {
-	clientIP, err := m.getClientIP(r)
+	clientIP, zoneID, err := m.getClientIP(r)
 	if err != nil {
 		m.logger.Error("getting client IP", zap.Error(err))
 		return false
 	}
-	for _, ipRange := range m.cidrs {
+	zoneFilter := true
+	for i, ipRange := range m.cidrs {
 		if ipRange.Contains(clientIP) {
-			return true
+			// Check if there are zone filters assigned and if they match.
+			if m.zones[i] == "" || zoneID == m.zones[i] {
+				return true
+			}
+			zoneFilter = false
 		}
+	}
+	if !zoneFilter {
+		m.logger.Debug("zone ID from remote did not match", zap.String("zone", zoneID))
 	}
 	return false
 }
@@ -935,14 +1301,14 @@ func (mre *MatchRegexp) Match(input string, repl *caddy.Replacer) bool {
 
 	// save all capture groups, first by index
 	for i, match := range matches {
-		key := fmt.Sprintf("%s.%d", mre.phPrefix, i)
+		key := mre.phPrefix + "." + strconv.Itoa(i)
 		repl.Set(key, match)
 	}
 
 	// then by name
 	for i, name := range mre.compiled.SubexpNames() {
 		if i != 0 && name != "" {
-			key := fmt.Sprintf("%s.%s", mre.phPrefix, name)
+			key := mre.phPrefix + "." + name
 			repl.Set(key, matches[i])
 		}
 	}
@@ -970,43 +1336,17 @@ func (mre *MatchRegexp) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// ResponseMatcher is a type which can determine if an
-// HTTP response matches some criteria.
-type ResponseMatcher struct {
-	// If set, one of these status codes would be required.
-	// A one-digit status can be used to represent all codes
-	// in that class (e.g. 3 for all 3xx codes).
-	StatusCode []int `json:"status_code,omitempty"`
-
-	// If set, each header specified must be one of the
-	// specified values, with the same logic used by the
-	// request header matcher.
-	Headers http.Header `json:"headers,omitempty"`
-}
-
-// Match returns true if the given statusCode and hdr match rm.
-func (rm ResponseMatcher) Match(statusCode int, hdr http.Header) bool {
-	if !rm.matchStatusCode(statusCode) {
-		return false
-	}
-	return matchHeaders(hdr, rm.Headers, "", nil)
-}
-
-func (rm ResponseMatcher) matchStatusCode(statusCode int) bool {
-	if rm.StatusCode == nil {
-		return true
-	}
-	for _, code := range rm.StatusCode {
-		if StatusCodeMatches(statusCode, code) {
-			return true
-		}
-	}
-	return false
-}
-
-var wordRE = regexp.MustCompile(`\w+`)
+var (
+	wordRE = regexp.MustCompile(`\w+`)
+)
 
 const regexpPlaceholderPrefix = "http.regexp"
+
+// MatcherErrorVarKey is the key used for the variable that
+// holds an optional error emitted from a request matcher,
+// to short-circuit the handler chain, since matchers cannot
+// return errors via the RequestMatcher interface.
+const MatcherErrorVarKey = "matchers.error"
 
 // Interface guards
 var (
@@ -1038,6 +1378,18 @@ var (
 	_ caddyfile.Unmarshaler = (*MatchRemoteIP)(nil)
 	_ caddyfile.Unmarshaler = (*VarsMatcher)(nil)
 	_ caddyfile.Unmarshaler = (*MatchVarsRE)(nil)
+
+	_ CELLibraryProducer = (*MatchHost)(nil)
+	_ CELLibraryProducer = (*MatchPath)(nil)
+	_ CELLibraryProducer = (*MatchPathRE)(nil)
+	_ CELLibraryProducer = (*MatchMethod)(nil)
+	_ CELLibraryProducer = (*MatchQuery)(nil)
+	_ CELLibraryProducer = (*MatchHeader)(nil)
+	_ CELLibraryProducer = (*MatchHeaderRE)(nil)
+	_ CELLibraryProducer = (*MatchProtocol)(nil)
+	_ CELLibraryProducer = (*MatchRemoteIP)(nil)
+	// _ CELLibraryProducer = (*VarsMatcher)(nil)
+	// _ CELLibraryProducer = (*MatchVarsRE)(nil)
 
 	_ json.Marshaler   = (*MatchNot)(nil)
 	_ json.Unmarshaler = (*MatchNot)(nil)

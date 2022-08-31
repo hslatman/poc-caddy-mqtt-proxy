@@ -27,8 +27,8 @@ import (
 
 // AutomationConfig governs the automated management of TLS certificates.
 type AutomationConfig struct {
-	// The list of automation policies. The first matching
-	// policy will be applied for a given certificate/name.
+	// The list of automation policies. The first policy matching
+	// a certificate or subject name will be applied.
 	Policies []*AutomationPolicy `json:"policies,omitempty"`
 
 	// On-Demand TLS defers certificate operations to the
@@ -39,7 +39,7 @@ type AutomationConfig struct {
 	// In 2015, Caddy became the first web server to
 	// implement this experimental technology.
 	//
-	// Note that this field does not enable on-demand TLS,
+	// Note that this field does not enable on-demand TLS;
 	// it only configures it for when it is used. To enable
 	// it, create an automation policy with `on_demand`.
 	OnDemand *OnDemandConfig `json:"on_demand,omitempty"`
@@ -89,9 +89,13 @@ type AutomationPolicy struct {
 	// zerossl.
 	IssuersRaw []json.RawMessage `json:"issuers,omitempty" caddy:"namespace=tls.issuance inline_key=module"`
 
-	// DEPRECATED: Use `issuers` instead (November 2020). This field will
-	// be removed in the future.
-	IssuerRaw json.RawMessage `json:"issuer,omitempty" caddy:"namespace=tls.issuance inline_key=module"`
+	// Modules that can get a custom certificate to use for any
+	// given TLS handshake at handshake-time. Custom certificates
+	// can be useful if another entity is managing certificates
+	// and Caddy need only get it and serve it.
+	//
+	// TODO: This is an EXPERIMENTAL feature. It is subject to change or removal.
+	ManagersRaw []json.RawMessage `json:"get_certificate,omitempty" caddy:"namespace=tls.get_certificate inline_key=via"`
 
 	// If true, certificates will be requested with MustStaple. Not all
 	// CAs support this, and there are potentially serious consequences
@@ -117,7 +121,7 @@ type AutomationPolicy struct {
 
 	// If true, certificates will be managed "on demand"; that is, during
 	// TLS handshakes or when needed, as opposed to at startup or config
-	// load.
+	// load. This enables On-Demand TLS for this policy.
 	OnDemand bool `json:"on_demand,omitempty"`
 
 	// Disables OCSP stapling. Disabling OCSP stapling puts clients at
@@ -133,10 +137,12 @@ type AutomationPolicy struct {
 	// EXPERIMENTAL. Subject to change.
 	OCSPOverrides map[string]string `json:"ocsp_overrides,omitempty"`
 
-	// Issuers stores the decoded issuer parameters. This is only
-	// used to populate an underlying certmagic.Config's Issuers
-	// field; it is not referenced thereafter.
-	Issuers []certmagic.Issuer `json:"-"`
+	// Issuers and Managers store the decoded issuer and manager modules;
+	// they are only used to populate an underlying certmagic.Config's
+	// fields during provisioning so that the modules can survive a
+	// re-provisioning.
+	Issuers  []certmagic.Issuer  `json:"-"`
+	Managers []certmagic.Manager `json:"-"`
 
 	magic   *certmagic.Config
 	storage certmagic.Storage
@@ -157,6 +163,7 @@ func (ap *AutomationPolicy) Provision(tlsApp *TLS) error {
 		ap.storage = cmStorage
 	}
 
+	// on-demand TLS
 	var ond *certmagic.OnDemandConfig
 	if ap.OnDemand {
 		ond = &certmagic.OnDemandConfig{
@@ -180,10 +187,20 @@ func (ap *AutomationPolicy) Provision(tlsApp *TLS) error {
 		}
 	}
 
-	// TODO: IssuerRaw field deprecated as of November 2020 - remove this shim after deprecation is complete
-	if ap.IssuerRaw != nil {
-		tlsApp.logger.Warn("the 'issuer' field is deprecated and will be removed in the future; use 'issuers' instead; your issuer has been appended automatically for now")
-		ap.IssuersRaw = append(ap.IssuersRaw, ap.IssuerRaw)
+	// we don't store loaded modules directly in the certmagic config since
+	// policy provisioning may happen more than once (during auto-HTTPS) and
+	// loading a module clears its config bytes; thus, load the module and
+	// store them on the policy before putting it on the config
+
+	// load and provision any cert manager modules
+	if ap.ManagersRaw != nil {
+		vals, err := tlsApp.ctx.LoadModule(ap, "ManagersRaw")
+		if err != nil {
+			return fmt.Errorf("loading external certificate manager modules: %v", err)
+		}
+		for _, getCertVal := range vals.([]interface{}) {
+			ap.Managers = append(ap.Managers, getCertVal.(certmagic.Manager))
+		}
 	}
 
 	// load and provision any explicitly-configured issuer modules
@@ -235,9 +252,10 @@ func (ap *AutomationPolicy) Provision(tlsApp *TLS) error {
 			DisableStapling:    ap.DisableOCSPStapling,
 			ResponderOverrides: ap.OCSPOverrides,
 		},
-		Storage: storage,
-		Issuers: issuers,
-		Logger:  tlsApp.logger,
+		Storage:  storage,
+		Issuers:  issuers,
+		Managers: ap.Managers,
+		Logger:   tlsApp.logger,
 	}
 	ap.magic = certmagic.New(tlsApp.certCache, template)
 
@@ -345,12 +363,23 @@ type DNSChallengeConfig struct {
 	// The TTL of the TXT record used for the DNS challenge.
 	TTL caddy.Duration `json:"ttl,omitempty"`
 
-	// How long to wait for DNS record to propagate.
+	// How long to wait before starting propagation checks.
+	// Default: 0 (no wait).
+	PropagationDelay caddy.Duration `json:"propagation_delay,omitempty"`
+
+	// Maximum time to wait for temporary DNS record to appear.
+	// Set to -1 to disable propagation checks.
+	// Default: 2 minutes.
 	PropagationTimeout caddy.Duration `json:"propagation_timeout,omitempty"`
 
 	// Custom DNS resolvers to prefer over system/built-in defaults.
 	// Often necessary to configure when using split-horizon DNS.
 	Resolvers []string `json:"resolvers,omitempty"`
+
+	// Override the domain to use for the DNS challenge. This
+	// is to delegate the challenge to a different domain,
+	// e.g. one that updates faster or one with a provider API.
+	OverrideDomain string `json:"override_domain,omitempty"`
 
 	solver acmez.Solver
 }

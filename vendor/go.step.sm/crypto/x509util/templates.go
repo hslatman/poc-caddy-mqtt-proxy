@@ -12,6 +12,8 @@ const (
 	InsecureKey           = "Insecure"
 	UserKey               = "User"
 	CertificateRequestKey = "CR"
+	AuthorizationCrtKey   = "AuthorizationCrt"
+	AuthorizationChainKey = "AuthorizationChain"
 )
 
 // TemplateError represents an error in a template produced by the fail
@@ -87,6 +89,18 @@ func (t TemplateData) SetUserData(v interface{}) {
 	t.SetInsecure(UserKey, v)
 }
 
+// SetAuthorizationCertificate sets the given certificate in the template. This certificate
+// is generally present in a token header.
+func (t TemplateData) SetAuthorizationCertificate(crt interface{}) {
+	t.Set(AuthorizationCrtKey, crt)
+}
+
+// SetAuthorizationCertificateChain sets a the given certificate chain in the
+// template. These certificates are generally present in a token header.
+func (t TemplateData) SetAuthorizationCertificateChain(chain interface{}) {
+	t.Set(AuthorizationChainKey, chain)
+}
+
 // SetCertificateRequest sets the given certificate request in the insecure
 // template data.
 func (t TemplateData) SetCertificateRequest(cr *x509.CertificateRequest) {
@@ -112,7 +126,7 @@ const DefaultLeafTemplate = `{
 // can be provided to force only the verified domains, if the option is true
 // `.SANs` will be set with the verified domains.
 const DefaultIIDLeafTemplate = `{
-	"subject": {"commonName":"{{ .Insecure.CR.Subject.CommonName }}"},
+	"subject": {"commonName": {{ toJson .Insecure.CR.Subject.CommonName }}},
 {{- if .SANs }}
 	"sans": {{ toJson .SANs }},
 {{- else }}
@@ -121,6 +135,23 @@ const DefaultIIDLeafTemplate = `{
 	"ipAddresses": {{ toJson .Insecure.CR.IPAddresses }},
 	"uris": {{ toJson .Insecure.CR.URIs }},
 {{- end }}
+{{- if typeIs "*rsa.PublicKey" .Insecure.CR.PublicKey }}
+	"keyUsage": ["keyEncipherment", "digitalSignature"],
+{{- else }}
+	"keyUsage": ["digitalSignature"],
+{{- end }}
+	"extKeyUsage": ["serverAuth", "clientAuth"]
+}`
+
+// DefaultAdminLeafTemplate is a template used by default by K8sSA and
+// admin-OIDC provisioners. This template takes all the SANs and subject from
+// the certificate request.
+const DefaultAdminLeafTemplate = `{
+	"subject": {{ toJson .Insecure.CR.Subject }},
+	"dnsNames": {{ toJson .Insecure.CR.DNSNames }},
+	"emailAddresses": {{ toJson .Insecure.CR.EmailAddresses }},
+	"ipAddresses": {{ toJson .Insecure.CR.IPAddresses }},
+	"uris": {{ toJson .Insecure.CR.URIs }},
 {{- if typeIs "*rsa.PublicKey" .Insecure.CR.PublicKey }}
 	"keyUsage": ["keyEncipherment", "digitalSignature"],
 {{- else }}

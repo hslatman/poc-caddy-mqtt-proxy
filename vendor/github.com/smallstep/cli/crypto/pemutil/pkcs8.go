@@ -246,13 +246,13 @@ func MarshalPKIXPublicKey(pub interface{}) ([]byte, error) {
 	case *rsa.PublicKey, *ecdsa.PublicKey:
 		return x509.MarshalPKIXPublicKey(pub)
 	case ed25519.PublicKey:
-		var pkix publicKeyInfo
-		pkix.Algo.Algorithm = oidEd25519
-		pkix.PublicKey = asn1.BitString{
+		var pki publicKeyInfo
+		pki.Algo.Algorithm = oidEd25519
+		pki.PublicKey = asn1.BitString{
 			Bytes:     p,
 			BitLength: 8 * len(p),
 		}
-		return asn1.Marshal(pkix)
+		return asn1.Marshal(pki)
 	default:
 		return nil, errors.Errorf("x509: unknown public key type: %T", pub)
 	}
@@ -288,6 +288,7 @@ func MarshalPKCS8PrivateKey(key interface{}) ([]byte, error) {
 // key derived using PBKDF2 over the given password.
 func DecryptPEMBlock(block *pem.Block, password []byte) ([]byte, error) {
 	if block.Headers["Proc-Type"] == "4,ENCRYPTED" {
+		//nolint
 		return x509.DecryptPEMBlock(block, password)
 	}
 

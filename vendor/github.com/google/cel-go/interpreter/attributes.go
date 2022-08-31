@@ -15,7 +15,6 @@
 package interpreter
 
 import (
-	"errors"
 	"fmt"
 	"math"
 
@@ -382,7 +381,7 @@ func (a *conditionalAttribute) Qualify(vars Activation, obj interface{}) (interf
 func (a *conditionalAttribute) Resolve(vars Activation) (interface{}, error) {
 	val := a.expr.Eval(vars)
 	if types.IsError(val) {
-		return nil, val.Value().(error)
+		return nil, val.(*types.Err)
 	}
 	if val == types.True {
 		return a.truthy.Resolve(vars)
@@ -393,7 +392,7 @@ func (a *conditionalAttribute) Resolve(vars Activation) (interface{}, error) {
 	if types.IsUnknown(val) {
 		return val, nil
 	}
-	return nil, types.ValOrErr(val, "no such overload").Value().(error)
+	return nil, types.MaybeNoSuchOverloadErr(val).(*types.Err)
 }
 
 // String is an implementation of the Stringer interface method.
@@ -476,19 +475,18 @@ func (a *maybeAttribute) AddQualifier(qual Qualifier) (Attribute, error) {
 	for _, attr := range a.attrs {
 		if isStr && len(attr.Qualifiers()) == 0 {
 			candidateVars := attr.CandidateVariableNames()
-			augmentedNames = make([]string,
-				len(candidateVars),
-				len(candidateVars))
+			augmentedNames = make([]string, len(candidateVars))
 			for i, name := range candidateVars {
 				augmentedNames[i] = fmt.Sprintf("%s.%s", name, str)
 			}
 		}
-		attr.AddQualifier(qual)
+		_, err := attr.AddQualifier(qual)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// Next, ensure the most specific variable / type reference is searched first.
-	a.attrs = append([]NamespacedAttribute{
-		a.fac.AbsoluteAttribute(qual.ID(), augmentedNames...),
-	}, a.attrs...)
+	a.attrs = append([]NamespacedAttribute{a.fac.AbsoluteAttribute(qual.ID(), augmentedNames...)}, a.attrs...)
 	return a, nil
 }
 
@@ -584,12 +582,12 @@ func (a *relativeAttribute) Resolve(vars Activation) (interface{}, error) {
 	// First, evaluate the operand.
 	v := a.operand.Eval(vars)
 	if types.IsError(v) {
-		return nil, v.Value().(error)
+		return nil, v.(*types.Err)
 	}
 	if types.IsUnknown(v) {
 		return v, nil
 	}
-	// Next, qualify it. Qualification handles unkonwns as well, so there's no need to recheck.
+	// Next, qualify it. Qualification handles unknowns as well, so there's no need to recheck.
 	var err error
 	var obj interface{} = v
 	for _, qual := range a.qualifiers {
@@ -627,6 +625,10 @@ func newQualifier(adapter ref.TypeAdapter, id int64, v interface{}) (Qualifier, 
 		qual = &uintQualifier{id: id, value: val, celValue: types.Uint(val), adapter: adapter}
 	case bool:
 		qual = &boolQualifier{id: id, value: val, celValue: types.Bool(val), adapter: adapter}
+	case float32:
+		qual = &doubleQualifier{id: id, value: float64(val), celValue: types.Double(val), adapter: adapter}
+	case float64:
+		qual = &doubleQualifier{id: id, value: val, celValue: types.Double(val), adapter: adapter}
 	case types.String:
 		qual = &stringQualifier{id: id, value: string(val), celValue: val, adapter: adapter}
 	case types.Int:
@@ -635,6 +637,8 @@ func newQualifier(adapter ref.TypeAdapter, id int64, v interface{}) (Qualifier, 
 		qual = &uintQualifier{id: id, value: uint64(val), celValue: val, adapter: adapter}
 	case types.Bool:
 		qual = &boolQualifier{id: id, value: bool(val), celValue: val, adapter: adapter}
+	case types.Double:
+		qual = &doubleQualifier{id: id, value: float64(val), celValue: val, adapter: adapter}
 	default:
 		return nil, fmt.Errorf("invalid qualifier type: %T", v)
 	}
@@ -712,9 +716,6 @@ func (q *stringQualifier) Qualify(vars Activation, obj interface{}) (interface{}
 		elem, err := refResolve(q.adapter, q.celValue, obj)
 		if err != nil {
 			return nil, err
-		}
-		if types.IsUnknown(elem) {
-			return elem, nil
 		}
 		return elem, nil
 	}
@@ -828,9 +829,6 @@ func (q *intQualifier) Qualify(vars Activation, obj interface{}) (interface{}, e
 		if err != nil {
 			return nil, err
 		}
-		if types.IsUnknown(elem) {
-			return elem, nil
-		}
 		return elem, nil
 	}
 	if isMap && !isKey {
@@ -890,9 +888,6 @@ func (q *uintQualifier) Qualify(vars Activation, obj interface{}) (interface{}, 
 		if err != nil {
 			return nil, err
 		}
-		if types.IsUnknown(elem) {
-			return elem, nil
-		}
 		return elem, nil
 	}
 	if isMap && !isKey {
@@ -940,9 +935,6 @@ func (q *boolQualifier) Qualify(vars Activation, obj interface{}) (interface{}, 
 		elem, err := refResolve(q.adapter, q.celValue, obj)
 		if err != nil {
 			return nil, err
-		}
-		if types.IsUnknown(elem) {
-			return elem, nil
 		}
 		return elem, nil
 	}
@@ -995,6 +987,37 @@ func (q *fieldQualifier) Cost() (min, max int64) {
 	return 0, 0
 }
 
+// doubleQualifier qualifies a CEL object, map, or list using a double value.
+//
+// This qualifier is used for working with dynamic data like JSON or protobuf.Any where the value
+// type may not be known ahead of time and may not conform to the standard types supported as valid
+// protobuf map key types.
+type doubleQualifier struct {
+	id       int64
+	value    float64
+	celValue ref.Val
+	adapter  ref.TypeAdapter
+}
+
+// ID is an implementation of the Qualifier interface method.
+func (q *doubleQualifier) ID() int64 {
+	return q.id
+}
+
+// Qualify implements the Qualifier interface method.
+func (q *doubleQualifier) Qualify(vars Activation, obj interface{}) (interface{}, error) {
+	switch o := obj.(type) {
+	case types.Unknown:
+		return o, nil
+	default:
+		elem, err := refResolve(q.adapter, q.celValue, obj)
+		if err != nil {
+			return nil, err
+		}
+		return elem, nil
+	}
+}
+
 // refResolve attempts to convert the value to a CEL value and then uses reflection methods
 // to try and resolve the qualifier.
 func refResolve(adapter ref.TypeAdapter, idx ref.Val, obj interface{}) (ref.Val, error) {
@@ -1005,16 +1028,13 @@ func refResolve(adapter ref.TypeAdapter, idx ref.Val, obj interface{}) (ref.Val,
 		if !found {
 			return nil, fmt.Errorf("no such key: %v", idx)
 		}
-		if types.IsError(elem) {
-			return nil, elem.Value().(error)
-		}
 		return elem, nil
 	}
 	indexer, isIndexer := celVal.(traits.Indexer)
 	if isIndexer {
 		elem := indexer.Get(idx)
 		if types.IsError(elem) {
-			return nil, elem.Value().(error)
+			return nil, elem.(*types.Err)
 		}
 		return elem, nil
 	}
@@ -1025,7 +1045,7 @@ func refResolve(adapter ref.TypeAdapter, idx ref.Val, obj interface{}) (ref.Val,
 	// future, then it would be reasonable to return error values as ref.Val types rather than
 	// simple go error types.
 	if types.IsError(celVal) {
-		return nil, celVal.Value().(error)
+		return nil, celVal.(*types.Err)
 	}
-	return nil, errors.New("no such overload")
+	return nil, fmt.Errorf("no such key: %v", idx)
 }

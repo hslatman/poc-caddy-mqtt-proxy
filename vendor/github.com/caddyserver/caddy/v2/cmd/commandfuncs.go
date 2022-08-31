@@ -19,21 +19,20 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
-	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
 
+	"github.com/aryann/difflib"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -45,6 +44,7 @@ func cmdStart(fl Flags) (int, error) {
 	startCmdConfigAdapterFlag := fl.String("adapter")
 	startCmdPidfileFlag := fl.String("pidfile")
 	startCmdWatchFlag := fl.Bool("watch")
+	startCmdEnvfileFlag := fl.String("envfile")
 
 	// open a listener to which the child process will connect when
 	// it is ready to confirm that it has successfully started
@@ -67,6 +67,9 @@ func cmdStart(fl Flags) (int, error) {
 	cmd := exec.Command(os.Args[0], "run", "--pingback", ln.Addr().String())
 	if startCmdConfigFlag != "" {
 		cmd.Args = append(cmd.Args, "--config", startCmdConfigFlag)
+	}
+	if startCmdEnvfileFlag != "" {
+		cmd.Args = append(cmd.Args, "--envfile", startCmdEnvfileFlag)
 	}
 	if startCmdConfigAdapterFlag != "" {
 		cmd.Args = append(cmd.Args, "--adapter", startCmdConfigAdapterFlag)
@@ -117,7 +120,7 @@ func cmdStart(fl Flags) (int, error) {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				if !strings.Contains(err.Error(), "use of closed network connection") {
+				if !errors.Is(err, net.ErrClosed) {
 					log.Println(err)
 				}
 				break
@@ -178,7 +181,7 @@ func cmdRun(fl Flags) (int, error) {
 	var config []byte
 	var err error
 	if runCmdResumeFlag {
-		config, err = ioutil.ReadFile(caddy.ConfigAutosavePath)
+		config, err = os.ReadFile(caddy.ConfigAutosavePath)
 		if os.IsNotExist(err) {
 			// not a bad error; just can't resume if autosave file doesn't exist
 			caddy.Log().Info("no autosave file exists", zap.String("autosave_file", caddy.ConfigAutosavePath))
@@ -200,7 +203,7 @@ func cmdRun(fl Flags) (int, error) {
 	// we don't use 'else' here since this value might have been changed in 'if' block; i.e. not mutually exclusive
 	var configFile string
 	if !runCmdResumeFlag {
-		config, configFile, err = loadConfig(runCmdConfigFlag, runCmdConfigAdapterFlag)
+		config, configFile, err = LoadConfig(runCmdConfigFlag, runCmdConfigAdapterFlag)
 		if err != nil {
 			return caddy.ExitCodeFailedStartup, err
 		}
@@ -216,7 +219,7 @@ func cmdRun(fl Flags) (int, error) {
 	// if we are to report to another process the successful start
 	// of the server, do so now by echoing back contents of stdin
 	if runCmdPingbackFlag != "" {
-		confirmationBytes, err := ioutil.ReadAll(os.Stdin)
+		confirmationBytes, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return caddy.ExitCodeFailedStartup,
 				fmt.Errorf("reading confirmation bytes from stdin: %v", err)
@@ -273,25 +276,33 @@ func cmdRun(fl Flags) (int, error) {
 }
 
 func cmdStop(fl Flags) (int, error) {
-	stopCmdAddrFlag := fl.String("address")
+	addrFlag := fl.String("address")
+	configFlag := fl.String("config")
+	configAdapterFlag := fl.String("adapter")
 
-	err := apiRequest(stopCmdAddrFlag, http.MethodPost, "/stop", nil, nil)
+	adminAddr, err := DetermineAdminAPIAddress(addrFlag, configFlag, configAdapterFlag)
+	if err != nil {
+		return caddy.ExitCodeFailedStartup, fmt.Errorf("couldn't determine admin API address: %v", err)
+	}
+
+	resp, err := AdminAPIRequest(adminAddr, http.MethodPost, "/stop", nil, nil)
 	if err != nil {
 		caddy.Log().Warn("failed using API to stop instance", zap.Error(err))
 		return caddy.ExitCodeFailedStartup, err
 	}
+	defer resp.Body.Close()
 
 	return caddy.ExitCodeSuccess, nil
 }
 
 func cmdReload(fl Flags) (int, error) {
-	reloadCmdConfigFlag := fl.String("config")
-	reloadCmdConfigAdapterFlag := fl.String("adapter")
-	reloadCmdAddrFlag := fl.String("address")
-	reloadCmdForceFlag := fl.Bool("force")
+	configFlag := fl.String("config")
+	configAdapterFlag := fl.String("adapter")
+	addrFlag := fl.String("address")
+	forceFlag := fl.Bool("force")
 
 	// get the config in caddy's native format
-	config, configFile, err := loadConfig(reloadCmdConfigFlag, reloadCmdConfigAdapterFlag)
+	config, configFile, err := LoadConfig(configFlag, configAdapterFlag)
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, err
 	}
@@ -299,36 +310,28 @@ func cmdReload(fl Flags) (int, error) {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("no config file to load")
 	}
 
-	// get the address of the admin listener; use flag if specified
-	adminAddr := reloadCmdAddrFlag
-	if adminAddr == "" && len(config) > 0 {
-		var tmpStruct struct {
-			Admin caddy.AdminConfig `json:"admin"`
-		}
-		err = json.Unmarshal(config, &tmpStruct)
-		if err != nil {
-			return caddy.ExitCodeFailedStartup,
-				fmt.Errorf("unmarshaling admin listener address from config: %v", err)
-		}
-		adminAddr = tmpStruct.Admin.Listen
+	adminAddr, err := DetermineAdminAPIAddress(addrFlag, configFlag, configAdapterFlag)
+	if err != nil {
+		return caddy.ExitCodeFailedStartup, fmt.Errorf("couldn't determine admin API address: %v", err)
 	}
 
 	// optionally force a config reload
 	headers := make(http.Header)
-	if reloadCmdForceFlag {
+	if forceFlag {
 		headers.Set("Cache-Control", "must-revalidate")
 	}
 
-	err = apiRequest(adminAddr, http.MethodPost, "/load", headers, bytes.NewReader(config))
+	resp, err := AdminAPIRequest(adminAddr, http.MethodPost, "/load", headers, bytes.NewReader(config))
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, fmt.Errorf("sending configuration to instance: %v", err)
 	}
+	defer resp.Body.Close()
 
 	return caddy.ExitCodeSuccess, nil
 }
 
 func cmdVersion(_ Flags) (int, error) {
-	fmt.Println(caddyVersion())
+	fmt.Println(CaddyVersion())
 	return caddy.ExitCodeSuccess, nil
 }
 
@@ -358,6 +361,7 @@ func cmdBuildInfo(fl Flags) (int, error) {
 func cmdListModules(fl Flags) (int, error) {
 	packages := fl.Bool("packages")
 	versions := fl.Bool("versions")
+	skipStandard := fl.Bool("skip-standard")
 
 	printModuleInfo := func(mi moduleInfo) {
 		fmt.Print(mi.caddyModuleID)
@@ -386,14 +390,19 @@ func cmdListModules(fl Flags) (int, error) {
 		return caddy.ExitCodeSuccess, nil
 	}
 
-	if len(standard) > 0 {
-		for _, mod := range standard {
-			printModuleInfo(mod)
-		}
-	}
-	fmt.Printf("\n  Standard modules: %d\n", len(standard))
-	if len(nonstandard) > 0 {
+	// Standard modules (always shipped with Caddy)
+	if !skipStandard {
 		if len(standard) > 0 {
+			for _, mod := range standard {
+				printModuleInfo(mod)
+			}
+		}
+		fmt.Printf("\n  Standard modules: %d\n", len(standard))
+	}
+
+	// Non-standard modules (third party plugins)
+	if len(nonstandard) > 0 {
+		if len(standard) > 0 && !skipStandard {
 			fmt.Println()
 		}
 		for _, mod := range nonstandard {
@@ -401,8 +410,10 @@ func cmdListModules(fl Flags) (int, error) {
 		}
 	}
 	fmt.Printf("\n  Non-standard modules: %d\n", len(nonstandard))
+
+	// Unknown modules (couldn't get Caddy module info)
 	if len(unknown) > 0 {
-		if len(standard) > 0 || len(nonstandard) > 0 {
+		if (len(standard) > 0 && !skipStandard) || len(nonstandard) > 0 {
 			fmt.Println()
 		}
 		for _, mod := range unknown {
@@ -454,7 +465,7 @@ func cmdAdaptConfig(fl Flags) (int, error) {
 			fmt.Errorf("unrecognized config adapter: %s", adaptCmdAdapterFlag)
 	}
 
-	input, err := ioutil.ReadFile(adaptCmdInputFlag)
+	input, err := os.ReadFile(adaptCmdInputFlag)
 	if err != nil {
 		return caddy.ExitCodeFailedStartup,
 			fmt.Errorf("reading input file: %v", err)
@@ -485,7 +496,9 @@ func cmdAdaptConfig(fl Flags) (int, error) {
 		if warn.Directive != "" {
 			msg = fmt.Sprintf("%s: %s", warn.Directive, warn.Message)
 		}
-		fmt.Fprintf(os.Stderr, "[WARNING][%s] %s:%d: %s\n", adaptCmdAdapterFlag, warn.File, warn.Line, msg)
+		caddy.Log().Named(adaptCmdAdapterFlag).Warn(msg,
+			zap.String("file", warn.File),
+			zap.Int("line", warn.Line))
 	}
 
 	// validate output if requested
@@ -508,7 +521,7 @@ func cmdValidateConfig(fl Flags) (int, error) {
 	validateCmdConfigFlag := fl.String("config")
 	validateCmdAdapterFlag := fl.String("adapter")
 
-	input, _, err := loadConfig(validateCmdConfigFlag, validateCmdAdapterFlag)
+	input, _, err := LoadConfig(validateCmdConfigFlag, validateCmdAdapterFlag)
 	if err != nil {
 		return caddy.ExitCodeFailedStartup, err
 	}
@@ -538,7 +551,7 @@ func cmdFmt(fl Flags) (int, error) {
 
 	// as a special case, read from stdin if the file name is "-"
 	if formatCmdConfigFile == "-" {
-		input, err := ioutil.ReadAll(os.Stdin)
+		input, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return caddy.ExitCodeFailedStartup,
 				fmt.Errorf("reading stdin: %v", err)
@@ -547,7 +560,7 @@ func cmdFmt(fl Flags) (int, error) {
 		return caddy.ExitCodeSuccess, nil
 	}
 
-	input, err := ioutil.ReadFile(formatCmdConfigFile)
+	input, err := os.ReadFile(formatCmdConfigFile)
 	if err != nil {
 		return caddy.ExitCodeFailedStartup,
 			fmt.Errorf("reading input file: %v", err)
@@ -556,153 +569,26 @@ func cmdFmt(fl Flags) (int, error) {
 	output := caddyfile.Format(input)
 
 	if fl.Bool("overwrite") {
-		if err := ioutil.WriteFile(formatCmdConfigFile, output, 0600); err != nil {
-			return caddy.ExitCodeFailedStartup, nil
+		if err := os.WriteFile(formatCmdConfigFile, output, 0600); err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("overwriting formatted file: %v", err)
+		}
+	} else if fl.Bool("diff") {
+		diff := difflib.Diff(
+			strings.Split(string(input), "\n"),
+			strings.Split(string(output), "\n"))
+		for _, d := range diff {
+			switch d.Delta {
+			case difflib.Common:
+				fmt.Printf("  %s\n", d.Payload)
+			case difflib.LeftOnly:
+				fmt.Printf("- %s\n", d.Payload)
+			case difflib.RightOnly:
+				fmt.Printf("+ %s\n", d.Payload)
+			}
 		}
 	} else {
 		fmt.Print(string(output))
 	}
-
-	return caddy.ExitCodeSuccess, nil
-}
-
-func cmdUpgrade(_ Flags) (int, error) {
-	l := caddy.Log()
-
-	thisExecPath, err := os.Executable()
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("determining current executable path: %v", err)
-	}
-	l.Info("this executable will be replaced", zap.String("path", thisExecPath))
-
-	// get the list of nonstandard plugins
-	_, nonstandard, _, err := getModules()
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("unable to enumerate installed plugins: %v", err)
-	}
-	pluginPkgs := make(map[string]struct{})
-	for _, mod := range nonstandard {
-		if mod.goModule.Replace != nil {
-			return caddy.ExitCodeFailedStartup, fmt.Errorf("cannot auto-upgrade when Go module has been replaced: %s => %s",
-				mod.goModule.Path, mod.goModule.Replace.Path)
-		}
-		l.Info("found non-standard module",
-			zap.String("id", mod.caddyModuleID),
-			zap.String("package", mod.goModule.Path))
-		pluginPkgs[mod.goModule.Path] = struct{}{}
-	}
-
-	// build the request URL to download this custom build
-	qs := url.Values{
-		"os":   {runtime.GOOS},
-		"arch": {runtime.GOARCH},
-	}
-	for pkg := range pluginPkgs {
-		qs.Add("p", pkg)
-	}
-	urlStr := fmt.Sprintf("https://caddyserver.com/api/download?%s", qs.Encode())
-
-	// initiate the build
-	l.Info("requesting build",
-		zap.String("os", qs.Get("os")),
-		zap.String("arch", qs.Get("arch")),
-		zap.Strings("packages", qs["p"]))
-	resp, err := http.Get(urlStr)
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("secure request failed: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		var details struct {
-			StatusCode int `json:"status_code"`
-			Error      struct {
-				Message string `json:"message"`
-				ID      string `json:"id"`
-			} `json:"error"`
-		}
-		err2 := json.NewDecoder(resp.Body).Decode(&details)
-		if err2 != nil {
-			return caddy.ExitCodeFailedStartup, fmt.Errorf("download and error decoding failed: HTTP %d: %v", resp.StatusCode, err2)
-		}
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("download failed: HTTP %d: %s (id=%s)", resp.StatusCode, details.Error.Message, details.Error.ID)
-	}
-
-	// back up the current binary, in case something goes wrong we can replace it
-	backupExecPath := thisExecPath + ".tmp"
-	l.Info("build acquired; backing up current executable",
-		zap.String("current_path", thisExecPath),
-		zap.String("backup_path", backupExecPath))
-	err = os.Rename(thisExecPath, backupExecPath)
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("backing up current binary: %v", err)
-	}
-	defer func() {
-		if err != nil {
-			err2 := os.Rename(backupExecPath, thisExecPath)
-			if err2 != nil {
-				l.Error("restoring original executable failed; will need to be restored manually",
-					zap.String("backup_path", backupExecPath),
-					zap.String("original_path", thisExecPath),
-					zap.Error(err2))
-			}
-		}
-	}()
-
-	// download the file; do this in a closure to close reliably before we execute it
-	writeFile := func() error {
-		destFile, err := os.OpenFile(thisExecPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0770)
-		if err != nil {
-			return fmt.Errorf("unable to open destination file: %v", err)
-		}
-		defer destFile.Close()
-
-		l.Info("downloading binary", zap.String("source", urlStr), zap.String("destination", thisExecPath))
-
-		_, err = io.Copy(destFile, resp.Body)
-		if err != nil {
-			return fmt.Errorf("unable to download file: %v", err)
-		}
-
-		err = destFile.Sync()
-		if err != nil {
-			return fmt.Errorf("syncing downloaded file to device: %v", err)
-		}
-
-		return nil
-	}
-	err = writeFile()
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, err
-	}
-
-	l.Info("download successful; displaying new binary details", zap.String("location", thisExecPath))
-
-	// use the new binary to print out version and module info
-	fmt.Print("\nModule versions:\n\n")
-	cmd := exec.Command(thisExecPath, "list-modules", "--versions")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("download succeeded, but unable to execute: %v", err)
-	}
-	fmt.Println("\nVersion:")
-	cmd = exec.Command(thisExecPath, "version")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("download succeeded, but unable to execute: %v", err)
-	}
-	fmt.Println()
-
-	// clean up the backup file
-	err = os.Remove(backupExecPath)
-	if err != nil {
-		return caddy.ExitCodeFailedStartup, fmt.Errorf("download succeeded, but unable to clean up backup binary: %v", err)
-	}
-
-	l.Info("upgrade successful; please restart any running Caddy instances", zap.String("executable", thisExecPath))
 
 	return caddy.ExitCodeSuccess, nil
 }
@@ -771,77 +657,25 @@ commands:
 	return caddy.ExitCodeSuccess, nil
 }
 
-func getModules() (standard, nonstandard, unknown []moduleInfo, err error) {
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
-		err = fmt.Errorf("no build info")
-		return
-	}
-
-	for _, modID := range caddy.Modules() {
-		modInfo, err := caddy.GetModule(modID)
-		if err != nil {
-			// that's weird, shouldn't happen
-			unknown = append(unknown, moduleInfo{caddyModuleID: modID, err: err})
-			continue
-		}
-
-		// to get the Caddy plugin's version info, we need to know
-		// the package that the Caddy module's value comes from; we
-		// can use reflection but we need a non-pointer value (I'm
-		// not sure why), and since New() should return a pointer
-		// value, we need to dereference it first
-		iface := interface{}(modInfo.New())
-		if rv := reflect.ValueOf(iface); rv.Kind() == reflect.Ptr {
-			iface = reflect.New(reflect.TypeOf(iface).Elem()).Elem().Interface()
-		}
-		modPkgPath := reflect.TypeOf(iface).PkgPath()
-
-		// now we find the Go module that the Caddy module's package
-		// belongs to; we assume the Caddy module package path will
-		// be prefixed by its Go module path, and we will choose the
-		// longest matching prefix in case there are nested modules
-		var matched *debug.Module
-		for _, dep := range bi.Deps {
-			if strings.HasPrefix(modPkgPath, dep.Path) {
-				if matched == nil || len(dep.Path) > len(matched.Path) {
-					matched = dep
-				}
-			}
-		}
-
-		caddyModGoMod := moduleInfo{caddyModuleID: modID, goModule: matched}
-
-		if strings.HasPrefix(modPkgPath, caddy.ImportPath) {
-			standard = append(standard, caddyModGoMod)
-		} else {
-			nonstandard = append(nonstandard, caddyModGoMod)
-		}
-	}
-	return
-}
-
-// apiRequest makes an API request to the endpoint adminAddr with the
-// given HTTP method and request URI. If body is non-nil, it will be
-// assumed to be Content-Type application/json.
-func apiRequest(adminAddr, method, uri string, headers http.Header, body io.Reader) error {
-	// parse the admin address
-	if adminAddr == "" {
-		adminAddr = caddy.DefaultAdminListen
-	}
+// AdminAPIRequest makes an API request according to the CLI flags given,
+// with the given HTTP method and request URI. If body is non-nil, it will
+// be assumed to be Content-Type application/json. The caller should close
+// the response body. Should only be used by Caddy CLI commands which
+// need to interact with a running instance of Caddy via the admin API.
+func AdminAPIRequest(adminAddr, method, uri string, headers http.Header, body io.Reader) (*http.Response, error) {
 	parsedAddr, err := caddy.ParseNetworkAddress(adminAddr)
 	if err != nil || parsedAddr.PortRangeSize() > 1 {
-		return fmt.Errorf("invalid admin address %s: %v", adminAddr, err)
+		return nil, fmt.Errorf("invalid admin address %s: %v", adminAddr, err)
 	}
-	origin := parsedAddr.JoinHostPort(0)
+	origin := "http://" + parsedAddr.JoinHostPort(0)
 	if parsedAddr.IsUnixNetwork() {
-		origin = "unixsocket" // hack so that http.NewRequest() is happy
+		origin = "http://unixsocket" // hack so that http.NewRequest() is happy
 	}
 
 	// form the request
-	req, err := http.NewRequest(method, "http://"+origin+uri, body)
+	req, err := http.NewRequest(method, origin+uri, body)
 	if err != nil {
-		return fmt.Errorf("making request: %v", err)
+		return nil, fmt.Errorf("making request: %v", err)
 	}
 	if parsedAddr.IsUnixNetwork() {
 		// When listening on a unix socket, the admin endpoint doesn't
@@ -881,20 +715,60 @@ func apiRequest(adminAddr, method, uri string, headers http.Header, body io.Read
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("performing request: %v", err)
+		return nil, fmt.Errorf("performing request: %v", err)
 	}
-	defer resp.Body.Close()
 
 	// if it didn't work, let the user know
 	if resp.StatusCode >= 400 {
-		respBody, err := ioutil.ReadAll(io.LimitReader(resp.Body, 1024*10))
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*10))
 		if err != nil {
-			return fmt.Errorf("HTTP %d: reading error message: %v", resp.StatusCode, err)
+			return nil, fmt.Errorf("HTTP %d: reading error message: %v", resp.StatusCode, err)
 		}
-		return fmt.Errorf("caddy responded with error: HTTP %d: %s", resp.StatusCode, respBody)
+		return nil, fmt.Errorf("caddy responded with error: HTTP %d: %s", resp.StatusCode, respBody)
 	}
 
-	return nil
+	return resp, nil
+}
+
+// DetermineAdminAPIAddress determines which admin API endpoint address should
+// be used based on the inputs. By priority: if `address` is specified, then
+// it is returned; if `configFile` (and `configAdapter`) are specified, then that
+// config will be loaded to find the admin address; otherwise, the default
+// admin listen address will be returned.
+func DetermineAdminAPIAddress(address, configFile, configAdapter string) (string, error) {
+	// Prefer the address if specified and non-empty
+	if address != "" {
+		return address, nil
+	}
+
+	// Try to load the config from file if specified, with the given adapter name
+	if configFile != "" {
+		// get the config in caddy's native format
+		config, loadedConfigFile, err := LoadConfig(configFile, configAdapter)
+		if err != nil {
+			return "", err
+		}
+		if loadedConfigFile == "" {
+			return "", fmt.Errorf("no config file to load")
+		}
+
+		// get the address of the admin listener if set
+		if len(config) > 0 {
+			var tmpStruct struct {
+				Admin caddy.AdminConfig `json:"admin"`
+			}
+			err = json.Unmarshal(config, &tmpStruct)
+			if err != nil {
+				return "", fmt.Errorf("unmarshaling admin listener address from config: %v", err)
+			}
+			if tmpStruct.Admin.Listen != "" {
+				return tmpStruct.Admin.Listen, nil
+			}
+		}
+	}
+
+	// Fallback to the default listen address otherwise
+	return caddy.DefaultAdminListen, nil
 }
 
 type moduleInfo struct {

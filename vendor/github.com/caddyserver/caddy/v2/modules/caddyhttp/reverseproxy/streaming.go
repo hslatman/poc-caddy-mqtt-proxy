@@ -29,17 +29,23 @@ import (
 	"go.uber.org/zap"
 )
 
-func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request, res *http.Response) {
+func (h Handler) handleUpgradeResponse(logger *zap.Logger, rw http.ResponseWriter, req *http.Request, res *http.Response) {
 	reqUpType := upgradeType(req.Header)
 	resUpType := upgradeType(res.Header)
-	if reqUpType != resUpType {
+
+	// Taken from https://github.com/golang/go/commit/5c489514bc5e61ad9b5b07bd7d8ec65d66a0512a
+	// We know reqUpType is ASCII, it's checked by the caller.
+	if !asciiIsPrint(resUpType) {
+		h.logger.Debug("backend tried to switch to invalid protocol",
+			zap.String("backend_upgrade", resUpType))
+		return
+	}
+	if !asciiEqualFold(reqUpType, resUpType) {
 		h.logger.Debug("backend tried to switch to unexpected protocol via Upgrade header",
 			zap.String("backend_upgrade", resUpType),
 			zap.String("requested_upgrade", reqUpType))
 		return
 	}
-
-	copyHeader(res.Header, rw.Header())
 
 	hj, ok := rw.(http.Hijacker)
 	if !ok {
@@ -65,12 +71,22 @@ func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request
 	}()
 	defer close(backConnCloseCh)
 
+	logger.Debug("upgrading connection")
 	conn, brw, err := hj.Hijack()
 	if err != nil {
-		h.logger.Error("Hijack failed on protocol switch", zap.Error(err))
+		h.logger.Error("hijack failed on protocol switch", zap.Error(err))
 		return
 	}
 	defer conn.Close()
+
+	start := time.Now()
+	defer func() {
+		logger.Debug("connection closed", zap.Duration("duration", time.Since(start)))
+	}()
+
+	copyHeader(rw.Header(), res.Header)
+
+	res.Header = rw.Header()
 	res.Body = nil // so res.Write only writes the headers; we have res.Body in backConn above
 	if err := res.Write(brw); err != nil {
 		h.logger.Debug("response write", zap.Error(err))
@@ -80,6 +96,7 @@ func (h Handler) handleUpgradeResponse(rw http.ResponseWriter, req *http.Request
 		h.logger.Debug("response flush", zap.Error(err))
 		return
 	}
+
 	errc := make(chan error, 1)
 	spc := switchProtocolCopier{user: conn, backend: backConn}
 	go spc.copyToBackend(errc)
@@ -99,13 +116,16 @@ func (h Handler) flushInterval(req *http.Request, res *http.Response) time.Durat
 		return -1 // negative means immediately
 	}
 
+	// We might have the case of streaming for which Content-Length might be unset.
+	if res.ContentLength == -1 {
+		return -1
+	}
+
 	// for h2 and h2c upstream streaming data to client (issues #3556 and #3606)
 	if h.isBidirectionalStream(req, res) {
 		return -1
 	}
 
-	// TODO: more specific cases? e.g. res.ContentLength == -1? (this TODO is from the std lib, but
-	// strangely similar to our isBidirectionalStream function that we implemented ourselves)
 	return time.Duration(h.FlushInterval)
 }
 
@@ -134,6 +154,11 @@ func (h Handler) copyResponse(dst io.Writer, src io.Reader, flushInterval time.D
 				latency: flushInterval,
 			}
 			defer mlw.stop()
+
+			// set up initial timer so headers get flushed even if body writes are delayed
+			mlw.flushPending = true
+			mlw.t = time.AfterFunc(flushInterval, mlw.delayedFlush)
+
 			dst = mlw
 		}
 	}

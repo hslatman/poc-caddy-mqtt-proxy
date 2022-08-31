@@ -220,11 +220,6 @@ func checkDNSPropagation(fqdn, value string, resolvers []string) (bool, error) {
 		return false, err
 	}
 
-	// TODO: make this configurable, maybe
-	// if !p.requireCompletePropagation {
-	// 	return true, nil
-	// }
-
 	if r.Rcode == dns.RcodeSuccess {
 		fqdn = updateDomainWithCName(r, fqdn)
 	}
@@ -313,11 +308,17 @@ func updateDomainWithCName(r *dns.Msg, fqdn string) string {
 }
 
 // recursiveNameservers are used to pre-check DNS propagation. It
-// prepends user-configured nameservers (custom) to the defaults
-// obtained from resolv.conf and defaultNameservers and ensures
-// that all server addresses have a port value.
+// picks user-configured nameservers (custom) OR the defaults
+// obtained from resolv.conf and defaultNameservers if none is
+// configured and ensures that all server addresses have a port value.
 func recursiveNameservers(custom []string) []string {
-	servers := append(custom, systemOrDefaultNameservers(defaultResolvConf, defaultNameservers)...)
+	var servers []string
+	if len(custom) == 0 {
+		servers = systemOrDefaultNameservers(defaultResolvConf, defaultNameservers)
+	} else {
+		servers = make([]string, len(custom))
+		copy(servers, custom)
+	}
 	populateNameserverPorts(servers)
 	return servers
 }

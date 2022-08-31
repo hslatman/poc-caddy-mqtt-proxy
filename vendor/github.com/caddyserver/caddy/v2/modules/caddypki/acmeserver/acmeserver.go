@@ -29,6 +29,7 @@ import (
 	"github.com/go-chi/chi"
 	"github.com/smallstep/certificates/acme"
 	acmeAPI "github.com/smallstep/certificates/acme/api"
+	acmeNoSQL "github.com/smallstep/certificates/acme/db/nosql"
 	"github.com/smallstep/certificates/authority"
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/db"
@@ -49,17 +50,16 @@ type Handler struct {
 
 	// The hostname or IP address by which ACME clients
 	// will access the server. This is used to populate
-	// the ACME directory endpoint. Default: localhost.
+	// the ACME directory endpoint. If not set, the Host
+	// header of the request will be used.
 	// COMPATIBILITY NOTE / TODO: This property may go away in the
-	// future, as it is currently only required due to
-	// limitations in the underlying library. Do not rely
-	// on this property long-term; check release notes.
+	// future. Do not rely on this property long-term; check release notes.
 	Host string `json:"host,omitempty"`
 
 	// The path prefix under which to serve all ACME
 	// endpoints. All other requests will not be served
 	// by this handler and will be passed through to
-	// the next one. Default: "/acme/"
+	// the next one. Default: "/acme/".
 	// COMPATIBILITY NOTE / TODO: This property may go away in the
 	// future, as it is currently only required due to
 	// limitations in the underlying library. Do not rely
@@ -92,9 +92,6 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
 	if ash.CA == "" {
 		ash.CA = caddypki.DefaultCAID
 	}
-	if ash.Host == "" {
-		ash.Host = defaultHost
-	}
 	if ash.PathPrefix == "" {
 		ash.PathPrefix = defaultPathPrefix
 	}
@@ -105,9 +102,9 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
 		return err
 	}
 	pkiApp := appModule.(*caddypki.PKI)
-	ca, ok := pkiApp.CAs[ash.CA]
-	if !ok {
-		return fmt.Errorf("no certificate authority configured with id: %s", ash.CA)
+	ca, err := pkiApp.GetCA(ctx, ash.CA)
+	if err != nil {
+		return err
 	}
 
 	database, err := ash.openDatabase()
@@ -138,17 +135,23 @@ func (ash *Handler) Provision(ctx caddy.Context) error {
 		return err
 	}
 
-	acmeAuth, err := acme.New(auth, acme.AuthorityOptions{
-		DB:     auth.GetDatabase().(nosql.DB),     // stores all the server state
-		DNS:    ash.Host,                          // used for directory links; TODO: not needed
-		Prefix: strings.Trim(ash.PathPrefix, "/"), // used for directory links
-	})
-	if err != nil {
-		return err
+	var acmeDB acme.DB
+	if authorityConfig.DB != nil {
+		acmeDB, err = acmeNoSQL.New(auth.GetDatabase().(nosql.DB))
+		if err != nil {
+			return fmt.Errorf("configuring ACME DB: %v", err)
+		}
 	}
 
 	// create the router for the ACME endpoints
-	acmeRouterHandler := acmeAPI.New(acmeAuth)
+	acmeRouterHandler := acmeAPI.NewHandler(acmeAPI.HandlerOptions{
+		CA:     auth,
+		DB:     acmeDB,                            // stores all the server state
+		DNS:    ash.Host,                          // used for directory links
+		Prefix: strings.Trim(ash.PathPrefix, "/"), // used for directory links
+	})
+
+	// extract its http.Handler so we can use it directly
 	r := chi.NewRouter()
 	r.Route(ash.PathPrefix, func(r chi.Router) {
 		acmeRouterHandler.Route(r)
@@ -212,10 +215,7 @@ func (ash Handler) openDatabase() (*db.AuthDB, error) {
 	return database.(databaseCloser).DB, err
 }
 
-const (
-	defaultHost       = "localhost"
-	defaultPathPrefix = "/acme/"
-)
+const defaultPathPrefix = "/acme/"
 
 var keyCleaner = regexp.MustCompile(`[^\w.-_]`)
 var databasePool = caddy.NewUsagePool()

@@ -98,13 +98,26 @@ type GetPublicKeyRequest struct {
 
 // CreateKeyRequest is the parameter used in the kms.CreateKey method.
 type CreateKeyRequest struct {
-	Name               string
+	// Name represents the key name or label used to identify a key.
+	//
+	// Used by: awskms, cloudkms, azurekms, pkcs11, yubikey.
+	Name string
+
+	// SignatureAlgorithm represents the type of key to create.
 	SignatureAlgorithm SignatureAlgorithm
-	Bits               int
+
+	// Bits is the number of bits on RSA keys.
+	Bits int
 
 	// ProtectionLevel specifies how cryptographic operations are performed.
-	// Used by: cloudkms
+	// Used by: cloudkms, azurekms.
 	ProtectionLevel ProtectionLevel
+
+	// Extractable defines if the new key may be exported from the HSM under a
+	// wrap key. On pkcs11 sets the CKA_EXTRACTABLE bit.
+	//
+	// Used by: pkcs11
+	Extractable bool
 }
 
 // CreateKeyResponse is the response value of the kms.CreateKey method.
@@ -126,6 +139,14 @@ type CreateSignerRequest struct {
 	Password      []byte
 }
 
+// CreateDecrypterRequest is the parameter used in the kms.Decrypt method.
+type CreateDecrypterRequest struct {
+	Decrypter        crypto.Decrypter
+	DecryptionKey    string
+	DecryptionKeyPEM []byte
+	Password         []byte
+}
+
 // LoadCertificateRequest is the parameter used in the LoadCertificate method of
 // a CertificateManager.
 type LoadCertificateRequest struct {
@@ -137,4 +158,10 @@ type LoadCertificateRequest struct {
 type StoreCertificateRequest struct {
 	Name        string
 	Certificate *x509.Certificate
+
+	// Extractable defines if the new certificate may be exported from the HSM
+	// under a wrap key. On pkcs11 sets the CKA_EXTRACTABLE bit.
+	//
+	// Used by: pkcs11
+	Extractable bool
 }

@@ -36,10 +36,11 @@ Current matchers:
 Current handlers:
 
 - **layer4.handlers.echo** - An echo server.
-- **layer4.handlers.proxy** - Powerful layer 4 proxy, capable of multiple upstreams (with load balancing and health checks) and establishing new TLS connections to backends.
+- **layer4.handlers.proxy** - Powerful layer 4 proxy, capable of multiple upstreams (with load balancing and health checks) and establishing new TLS connections to backends. Optionally supports sending the [HAProxy proxy protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt).
 - **layer4.handlers.tee** - Branches the handling of a connection into a concurrent handler chain.
 - **layer4.handlers.throttle** - Throttle connections to simulate slowness and latency.
 - **layer4.handlers.tls** - TLS termination.
+- **layer4.handlers.proxy_protocol** - Accepts the [HAPROXY proxy protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) on the receiving side.
 
 Like the `http` app, some handlers are "terminal" meaning that they don't call the next handler in the chain. For example: `echo` and `proxy` are terminal handlers because they consume the client's input.
 
@@ -118,9 +119,60 @@ A simple echo server with TLS termination that uses a self-signed cert for `loca
 			"automation": {
 				"policies": [
 					{
-						"issuer": {"module": "internal"}
+						"issuers": [{"module": "internal"}]
 					}
 				]
+			}
+		}
+	}
+}
+```
+
+A simple TCP reverse proxy that terminates TLS on 993, and sends the PROXY protocol header to 1143 through 143:
+
+```json
+{
+	"apps": {
+		"layer4": {
+			"servers": {
+				"secure-imap": {
+					"listen": ["0.0.0.0:993"],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handler": "tls"
+								},
+								{
+									"handler": "proxy",
+									"proxy_protocol": "v1",
+									"upstreams": [
+										{"dial": ["localhost:143"]}
+									]
+								}
+							]
+						}
+					]
+				},
+				"normal-imap": {
+					"listen": ["0.0.0.0:143"],
+					"routes": [
+						{
+							"handle": [
+								{
+									"handler": "proxy_protocol"
+								},
+								{
+									"handler": "proxy",
+									"proxy_protocol": "v2",
+									"upstreams": [
+										{"dial": ["localhost:1143"]}
+									]
+								}
+							]
+						}
+					]
+				}
 			}
 		}
 	}
@@ -175,7 +227,69 @@ A multiplexer that proxies HTTP to one backend, and TLS to another (without term
 }
 ```
 
+Same as previous, but only applies to HTTP requests with specific hosts:
 
+```json
+{
+	"apps": {
+		"layer4": {
+			"servers": {
+				"example": {
+					"listen": ["127.0.0.1:5000"],
+					"routes": [
+						{
+							"match": [
+								{
+									"http": [
+										{"host": ["example.com"]}
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"match": [
+												{
+													"http": []
+												}
+											],
+											"handle": [
+												{
+													"handler": "proxy",
+													"upstreams": [
+														{"dial": ["localhost:80"]}
+													]
+												}
+											]
+										},
+										{
+											"match": [
+												{
+													"tls": {}
+												}
+											],
+											"handle": [
+												{
+													"handler": "proxy",
+													"upstreams": [
+														{"dial": ["localhost:443"]}
+													]
+												}
+											]
+										}
+									]
+								}
+							]
+						}
+					]
+				}
+			}
+		}
+	}
+}
+```
 
 Same as previous, but filter by HTTP Host header and/or TLS ClientHello ServerName:
 

@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,6 +29,7 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -65,7 +65,7 @@ type Transport struct {
 	// Extra environment variables.
 	EnvVars map[string]string `json:"env,omitempty"`
 
-	// The duration used to set a deadline when connecting to an upstream.
+	// The duration used to set a deadline when connecting to an upstream. Default: `3s`.
 	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
 
 	// The duration used to set a deadline when reading from the FastCGI server.
@@ -89,18 +89,34 @@ func (Transport) CaddyModule() caddy.ModuleInfo {
 // Provision sets up t.
 func (t *Transport) Provision(ctx caddy.Context) error {
 	t.logger = ctx.Logger(t)
+
 	if t.Root == "" {
 		t.Root = "{http.vars.root}"
 	}
+
 	t.serverSoftware = "Caddy"
 	if mod := caddy.GoModule(); mod.Version != "" {
 		t.serverSoftware += "/" + mod.Version
 	}
+
+	// Set a relatively short default dial timeout.
+	// This is helpful to make load-balancer retries more speedy.
+	if t.DialTimeout == 0 {
+		t.DialTimeout = caddy.Duration(3 * time.Second)
+	}
+
 	return nil
 }
 
 // RoundTrip implements http.RoundTripper.
 func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
+	// Disallow null bytes in the request path, because
+	// PHP upstreams may do bad things, like execute a
+	// non-PHP file as PHP code. See #4574
+	if strings.Contains(r.URL.Path, "\x00") {
+		return nil, caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("invalid request path"))
+	}
+
 	env, err := t.buildEnv(r)
 	if err != nil {
 		return nil, fmt.Errorf("building environment: %v", err)
@@ -124,7 +140,7 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	t.logger.Debug("roundtrip",
 		zap.Object("request", caddyhttp.LoggableHTTPRequest{Request: r}),
 		zap.String("dial", address),
-		zap.Any("env", env), // TODO: this uses reflection I think
+		zap.Object("env", env),
 	)
 
 	fcgiBackend, err := DialContext(ctx, network, address)
@@ -163,10 +179,10 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // buildEnv returns a set of CGI environment variables for the request.
-func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
+func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
-	var env map[string]string
+	var env envVars
 
 	// Separate remote IP and port; more lenient than net.SplitHostPort
 	var ip, port string
@@ -218,12 +234,7 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 	}
 
 	// SCRIPT_FILENAME is the absolute path of SCRIPT_NAME
-	scriptFilename := filepath.Join(root, scriptName)
-
-	// Add vhost path prefix to scriptName. Otherwise, some PHP software will
-	// have difficulty discovering its URL.
-	pathPrefix, _ := r.Context().Value(caddy.CtxKey("path_prefix")).(string)
-	scriptName = path.Join(pathPrefix, scriptName)
+	scriptFilename := caddyhttp.SanitizedPathJoin(root, scriptName)
 
 	// Ensure the SCRIPT_NAME has a leading slash for compliance with RFC3875
 	// Info: https://tools.ietf.org/html/rfc3875#section-4.1.13
@@ -236,13 +247,7 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 	// original URI in as the value of REQUEST_URI (the user can overwrite this
 	// if desired). Most PHP apps seem to want the original URI. Besides, this is
 	// how nginx defaults: http://stackoverflow.com/a/12485156/1048862
-	origReq, ok := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
-	if !ok {
-		// some requests, like active health checks, don't add this to
-		// the request context, so we can just use the current URL
-		origReq = *r
-	}
-	reqURL := origReq.URL
+	origReq := r.Context().Value(caddyhttp.OriginalRequestCtxKey).(http.Request)
 
 	requestScheme := "http"
 	if r.TLS != nil {
@@ -262,7 +267,7 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.
-	env = map[string]string{
+	env = envVars{
 		// Variables defined in CGI 1.1 spec
 		"AUTH_TYPE":         "", // Not used
 		"CONTENT_LENGTH":    r.Header.Get("Content-Length"),
@@ -285,7 +290,7 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 		"DOCUMENT_ROOT":   root,
 		"DOCUMENT_URI":    docURI,
 		"HTTP_HOST":       r.Host, // added here, since not always part of headers
-		"REQUEST_URI":     reqURL.RequestURI(),
+		"REQUEST_URI":     origReq.URL.RequestURI(),
 		"SCRIPT_FILENAME": scriptFilename,
 		"SCRIPT_NAME":     scriptName,
 	}
@@ -294,14 +299,19 @@ func (t Transport) buildEnv(r *http.Request) (map[string]string, error) {
 	// PATH_TRANSLATED should only exist if PATH_INFO is defined.
 	// Info: https://www.ietf.org/rfc/rfc3875 Page 14
 	if env["PATH_INFO"] != "" {
-		env["PATH_TRANSLATED"] = filepath.Join(root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
+		env["PATH_TRANSLATED"] = caddyhttp.SanitizedPathJoin(root, pathInfo) // Info: http://www.oreilly.com/openbook/cgi/ch02_04.html
 	}
 
 	// compliance with the CGI specification requires that
-	// SERVER_PORT should only exist if it's a valid numeric value.
-	// Info: https://www.ietf.org/rfc/rfc3875 Page 18
+	// the SERVER_PORT variable MUST be set to the TCP/IP port number on which this request is received from the client
+	// even if the port is the default port for the scheme and could otherwise be omitted from a URI.
+	// https://tools.ietf.org/html/rfc3875#section-4.1.15
 	if reqPort != "" {
 		env["SERVER_PORT"] = reqPort
+	} else if requestScheme == "http" {
+		env["SERVER_PORT"] = "80"
+	} else if requestScheme == "https" {
+		env["SERVER_PORT"] = "443"
 	}
 
 	// Some web apps rely on knowing HTTPS or not
@@ -356,6 +366,16 @@ func (t Transport) splitPos(path string) int {
 	return -1
 }
 
+// envVars is a simple type to allow for speeding up zap log encoding.
+type envVars map[string]string
+
+func (env envVars) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	for k, v := range env {
+		enc.AddString(k, v)
+	}
+	return nil
+}
+
 // Map of supported protocols to Apache ssl_mod format
 // Note that these are slightly different from SupportedProtocols in caddytls/config.go
 var tlsProtocolStrings = map[uint16]string{
@@ -369,6 +389,8 @@ var headerNameReplacer = strings.NewReplacer(" ", "_", "-", "_")
 
 // Interface guards
 var (
+	_ zapcore.ObjectMarshaler = (*envVars)(nil)
+
 	_ caddy.Provisioner = (*Transport)(nil)
 	_ http.RoundTripper = (*Transport)(nil)
 )

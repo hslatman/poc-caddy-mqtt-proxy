@@ -8,6 +8,7 @@ import (
 
 	"github.com/lucas-clemente/quic-go/internal/flowcontrol"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/lucas-clemente/quic-go/internal/qerr"
 	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/internal/wire"
 )
@@ -38,7 +39,7 @@ type receiveStream struct {
 
 	closeForShutdownErr error
 	cancelReadErr       error
-	resetRemotelyErr    StreamError
+	resetRemotelyErr    *StreamError
 
 	closedForShutdown bool // set when CloseForShutdown() is called
 	finRead           bool // set once we read a frame with a Fin
@@ -46,6 +47,7 @@ type receiveStream struct {
 	resetRemotely     bool // set when HandleResetStreamFrame() is called
 
 	readChan chan struct{}
+	readOnce chan struct{} // cap: 1, to protect against concurrent use of Read
 	deadline time.Time
 
 	flowController flowcontrol.StreamFlowController
@@ -69,6 +71,7 @@ func newReceiveStream(
 		flowController: flowController,
 		frameQueue:     newFrameSorter(),
 		readChan:       make(chan struct{}, 1),
+		readOnce:       make(chan struct{}, 1),
 		finalOffset:    protocol.MaxByteCount,
 		version:        version,
 	}
@@ -80,6 +83,12 @@ func (s *receiveStream) StreamID() protocol.StreamID {
 
 // Read implements io.Reader. It is not thread safe!
 func (s *receiveStream) Read(p []byte) (int, error) {
+	// Concurrent use of Read is not permitted (and doesn't make any sense),
+	// but sometimes people do it anyway.
+	// Make sure that we only execute one call at any given time to avoid hard to debug failures.
+	s.readOnce <- struct{}{}
+	defer func() { <-s.readOnce }()
+
 	s.mutex.Lock()
 	completed, n, err := s.readImpl(p)
 	s.mutex.Unlock()
@@ -104,7 +113,7 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 		return false, 0, s.closeForShutdownErr
 	}
 
-	bytesRead := 0
+	var bytesRead int
 	var deadlineTimer *utils.Timer
 	for bytesRead < len(p) {
 		if s.currentFrame == nil || s.readPosInFrame >= len(s.currentFrame) {
@@ -165,13 +174,10 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 			return false, bytesRead, fmt.Errorf("BUG: readPosInFrame (%d) > frame.DataLen (%d) in stream.Read", s.readPosInFrame, len(s.currentFrame))
 		}
 
-		s.mutex.Unlock()
-
 		m := copy(p[bytesRead:], s.currentFrame[s.readPosInFrame:])
 		s.readPosInFrame += m
 		bytesRead += m
 
-		s.mutex.Lock()
 		// when a RESET_STREAM was received, the was already informed about the final byteOffset for this stream
 		if !s.resetRemotely {
 			s.flowController.AddBytesRead(protocol.ByteCount(m))
@@ -196,7 +202,7 @@ func (s *receiveStream) dequeueNextFrame() {
 	s.readPosInFrame = 0
 }
 
-func (s *receiveStream) CancelRead(errorCode protocol.ApplicationErrorCode) {
+func (s *receiveStream) CancelRead(errorCode StreamErrorCode) {
 	s.mutex.Lock()
 	completed := s.cancelReadImpl(errorCode)
 	s.mutex.Unlock()
@@ -207,7 +213,7 @@ func (s *receiveStream) CancelRead(errorCode protocol.ApplicationErrorCode) {
 	}
 }
 
-func (s *receiveStream) cancelReadImpl(errorCode protocol.ApplicationErrorCode) bool /* completed */ {
+func (s *receiveStream) cancelReadImpl(errorCode qerr.StreamErrorCode) bool /* completed */ {
 	if s.finRead || s.canceledRead || s.resetRemotely {
 		return false
 	}
@@ -281,9 +287,9 @@ func (s *receiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame)
 		return false, nil
 	}
 	s.resetRemotely = true
-	s.resetRemotelyErr = streamCanceledError{
-		errorCode: frame.ErrorCode,
-		error:     fmt.Errorf("stream %d was reset with error code %d", s.streamID, frame.ErrorCode),
+	s.resetRemotelyErr = &StreamError{
+		StreamID:  s.streamID,
+		ErrorCode: frame.ErrorCode,
 	}
 	s.signalRead()
 	return newlyRcvdFinalOffset, nil

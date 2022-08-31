@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/lucas-clemente/quic-go/internal/ackhandler"
-
 	"github.com/lucas-clemente/quic-go/internal/flowcontrol"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/lucas-clemente/quic-go/internal/qerr"
 	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/internal/wire"
 )
@@ -50,6 +50,7 @@ type sendStream struct {
 	nextFrame      *wire.StreamFrame
 
 	writeChan chan struct{}
+	writeOnce chan struct{}
 	deadline  time.Time
 
 	flowController flowcontrol.StreamFlowController
@@ -73,6 +74,7 @@ func newSendStream(
 		sender:         sender,
 		flowController: flowController,
 		writeChan:      make(chan struct{}, 1),
+		writeOnce:      make(chan struct{}, 1), // cap: 1, to protect against concurrent use of Write
 		version:        version,
 	}
 	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
@@ -84,6 +86,12 @@ func (s *sendStream) StreamID() protocol.StreamID {
 }
 
 func (s *sendStream) Write(p []byte) (int, error) {
+	// Concurrent use of Write is not permitted (and doesn't make any sense),
+	// but sometimes people do it anyway.
+	// Make sure that we only execute one call at any given time to avoid hard to debug failures.
+	s.writeOnce <- struct{}{}
+	defer func() { <-s.writeOnce }()
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -407,12 +415,12 @@ func (s *sendStream) Close() error {
 	return nil
 }
 
-func (s *sendStream) CancelWrite(errorCode protocol.ApplicationErrorCode) {
+func (s *sendStream) CancelWrite(errorCode StreamErrorCode) {
 	s.cancelWriteImpl(errorCode, fmt.Errorf("Write on stream %d canceled with error code %d", s.streamID, errorCode))
 }
 
 // must be called after locking the mutex
-func (s *sendStream) cancelWriteImpl(errorCode protocol.ApplicationErrorCode, writeErr error) {
+func (s *sendStream) cancelWriteImpl(errorCode qerr.StreamErrorCode, writeErr error) {
 	s.mutex.Lock()
 	if s.canceledWrite {
 		s.mutex.Unlock()
@@ -449,11 +457,10 @@ func (s *sendStream) updateSendWindow(limit protocol.ByteCount) {
 }
 
 func (s *sendStream) handleStopSendingFrame(frame *wire.StopSendingFrame) {
-	writeErr := streamCanceledError{
-		errorCode: frame.ErrorCode,
-		error:     fmt.Errorf("stream %d was reset with error code %d", s.streamID, frame.ErrorCode),
-	}
-	s.cancelWriteImpl(frame.ErrorCode, writeErr)
+	s.cancelWriteImpl(frame.ErrorCode, &StreamError{
+		StreamID:  s.streamID,
+		ErrorCode: frame.ErrorCode,
+	})
 }
 
 func (s *sendStream) Context() context.Context {

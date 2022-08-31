@@ -35,12 +35,16 @@ type Activation interface {
 	Parent() Activation
 }
 
-// EmptyActivation returns a variable free activation.
+// EmptyActivation returns a variable-free activation.
 func EmptyActivation() Activation {
-	// This call cannot fail.
-	a, _ := NewActivation(map[string]interface{}{})
-	return a
+	return emptyActivation{}
 }
+
+// emptyActivation is a variable-free activation.
+type emptyActivation struct{}
+
+func (emptyActivation) ResolveName(string) (interface{}, bool) { return nil, false }
+func (emptyActivation) Parent() Activation                     { return nil }
 
 // NewActivation returns an activation based on a map-based binding where the map keys are
 // expected to be qualified names used with ResolveName calls.
@@ -77,7 +81,6 @@ func NewActivation(bindings interface{}) (Activation, error) {
 // Named bindings may lazily supply values by providing a function which accepts no arguments and
 // produces an interface value.
 type mapActivation struct {
-	adapter  ref.TypeAdapter
 	bindings map[string]interface{}
 }
 
@@ -163,14 +166,6 @@ type partActivation struct {
 // UnknownAttributePatterns implements the PartialActivation interface method.
 func (a *partActivation) UnknownAttributePatterns() []*AttributePattern {
 	return a.unknowns
-}
-
-// newVarActivation returns a new varActivation instance.
-func newVarActivation(parent Activation, name string) *varActivation {
-	return &varActivation{
-		parent: parent,
-		name:   name,
-	}
 }
 
 // varActivation represents a single mutable variable binding.

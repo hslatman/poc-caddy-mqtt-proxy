@@ -20,7 +20,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -94,7 +93,7 @@ func Main() {
 // the bytes in expect, or returns an error if it doesn't.
 func handlePingbackConn(conn net.Conn, expect []byte) error {
 	defer conn.Close()
-	confirmationBytes, err := ioutil.ReadAll(io.LimitReader(conn, 32))
+	confirmationBytes, err := io.ReadAll(io.LimitReader(conn, 32))
 	if err != nil {
 		return err
 	}
@@ -104,15 +103,15 @@ func handlePingbackConn(conn net.Conn, expect []byte) error {
 	return nil
 }
 
-// loadConfig loads the config from configFile and adapts it
+// LoadConfig loads the config from configFile and adapts it
 // using adapterName. If adapterName is specified, configFile
 // must be also. If no configFile is specified, it tries
 // loading a default config file. The lack of a config file is
 // not treated as an error, but false will be returned if
 // there is no config available. It prints any warnings to stderr,
 // and returns the resulting JSON config bytes along with
-// whether a config file was loaded or not.
-func loadConfig(configFile, adapterName string) ([]byte, string, error) {
+// the name of the loaded config file (if any).
+func LoadConfig(configFile, adapterName string) ([]byte, string, error) {
 	// specifying an adapter without a config file is ambiguous
 	if adapterName != "" && configFile == "" {
 		return nil, "", fmt.Errorf("cannot adapt config without config file (use --config)")
@@ -124,9 +123,9 @@ func loadConfig(configFile, adapterName string) ([]byte, string, error) {
 	var err error
 	if configFile != "" {
 		if configFile == "-" {
-			config, err = ioutil.ReadAll(os.Stdin)
+			config, err = io.ReadAll(os.Stdin)
 		} else {
-			config, err = ioutil.ReadFile(configFile)
+			config, err = os.ReadFile(configFile)
 		}
 		if err != nil {
 			return nil, "", fmt.Errorf("reading config file: %v", err)
@@ -140,7 +139,7 @@ func loadConfig(configFile, adapterName string) ([]byte, string, error) {
 		// plugged in, and if so, try using a default Caddyfile
 		cfgAdapter = caddyconfig.GetAdapter("caddyfile")
 		if cfgAdapter != nil {
-			config, err = ioutil.ReadFile("Caddyfile")
+			config, err = os.ReadFile("Caddyfile")
 			if os.IsNotExist(err) {
 				// okay, no default Caddyfile; pretend like this never happened
 				cfgAdapter = nil
@@ -263,7 +262,7 @@ func watchConfigFile(filename, adapterName string) {
 		lastModified = info.ModTime()
 
 		// load the contents of the file
-		config, _, err := loadConfig(filename, adapterName)
+		config, _, err := LoadConfig(filename, adapterName)
 		if err != nil {
 			logger().Error("unable to load latest config", zap.Error(err))
 			continue
@@ -361,45 +360,76 @@ func loadEnvFromFile(envFile string) error {
 		}
 	}
 
+	// Update the storage paths to ensure they have the proper
+	// value after loading a specified env file.
+	caddy.ConfigAutosavePath = filepath.Join(caddy.AppConfigDir(), "autosave.json")
+	caddy.DefaultStorage = &certmagic.FileStorage{Path: caddy.AppDataDir()}
+
 	return nil
 }
 
+// parseEnvFile parses an env file from KEY=VALUE format.
+// It's pretty naive. Limited value quotation is supported,
+// but variable and command expansions are not supported.
 func parseEnvFile(envInput io.Reader) (map[string]string, error) {
 	envMap := make(map[string]string)
 
 	scanner := bufio.NewScanner(envInput)
-	var line string
-	lineNumber := 0
+	var lineNumber int
 
 	for scanner.Scan() {
-		line = strings.TrimSpace(scanner.Text())
+		line := strings.TrimSpace(scanner.Text())
 		lineNumber++
 
-		// skip lines starting with comment
-		if strings.HasPrefix(line, "#") {
+		// skip empty lines and lines starting with comment
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// skip empty line
-		if len(line) == 0 {
-			continue
-		}
-
+		// split line into key and value
 		fields := strings.SplitN(line, "=", 2)
 		if len(fields) != 2 {
 			return nil, fmt.Errorf("can't parse line %d; line should be in KEY=VALUE format", lineNumber)
 		}
+		key, val := fields[0], fields[1]
 
-		if strings.Contains(fields[0], " ") {
-			return nil, fmt.Errorf("bad key on line %d: contains whitespace", lineNumber)
-		}
+		// sometimes keys are prefixed by "export " so file can be sourced in bash; ignore it here
+		key = strings.TrimPrefix(key, "export ")
 
-		key := fields[0]
-		val := fields[1]
-
+		// validate key and value
 		if key == "" {
 			return nil, fmt.Errorf("missing or empty key on line %d", lineNumber)
 		}
+		if strings.Contains(key, " ") {
+			return nil, fmt.Errorf("invalid key on line %d: contains whitespace: %s", lineNumber, key)
+		}
+		if strings.HasPrefix(val, " ") || strings.HasPrefix(val, "\t") {
+			return nil, fmt.Errorf("invalid value on line %d: whitespace before value: '%s'", lineNumber, val)
+		}
+
+		// remove any trailing comment after value
+		if commentStart := strings.Index(val, "#"); commentStart > 0 {
+			before := val[commentStart-1]
+			if before == '\t' || before == ' ' {
+				val = strings.TrimRight(val[:commentStart], " \t")
+			}
+		}
+
+		// quoted value: support newlines
+		if strings.HasPrefix(val, `"`) {
+			for !(strings.HasSuffix(line, `"`) && !strings.HasSuffix(line, `\"`)) {
+				val = strings.ReplaceAll(val, `\"`, `"`)
+				if !scanner.Scan() {
+					break
+				}
+				lineNumber++
+				line = strings.ReplaceAll(scanner.Text(), `\"`, `"`)
+				val += "\n" + line
+			}
+			val = strings.TrimPrefix(val, `"`)
+			val = strings.TrimSuffix(val, `"`)
+		}
+
 		envMap[key] = val
 	}
 
@@ -415,7 +445,7 @@ func printEnvironment() {
 	fmt.Printf("caddy.AppDataDir=%s\n", caddy.AppDataDir())
 	fmt.Printf("caddy.AppConfigDir=%s\n", caddy.AppConfigDir())
 	fmt.Printf("caddy.ConfigAutosavePath=%s\n", caddy.ConfigAutosavePath)
-	fmt.Printf("caddy.Version=%s\n", caddyVersion())
+	fmt.Printf("caddy.Version=%s\n", CaddyVersion())
 	fmt.Printf("runtime.GOOS=%s\n", runtime.GOOS)
 	fmt.Printf("runtime.GOARCH=%s\n", runtime.GOARCH)
 	fmt.Printf("runtime.Compiler=%s\n", runtime.Compiler)
@@ -432,8 +462,8 @@ func printEnvironment() {
 	}
 }
 
-// caddyVersion returns a detailed version string, if available.
-func caddyVersion() string {
+// CaddyVersion returns a detailed version string, if available.
+func CaddyVersion() string {
 	goModule := caddy.GoModule()
 	ver := goModule.Version
 	if goModule.Sum != "" {

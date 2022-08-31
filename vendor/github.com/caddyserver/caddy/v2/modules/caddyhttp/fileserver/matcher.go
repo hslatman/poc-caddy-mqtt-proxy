@@ -19,12 +19,21 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/google/cel-go/cel"
+	"github.com/google/cel-go/checker/decls"
+	"github.com/google/cel-go/common"
+	"github.com/google/cel-go/common/operators"
+	"github.com/google/cel-go/common/types/ref"
+	"github.com/google/cel-go/interpreter/functions"
+	"github.com/google/cel-go/parser"
+	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
 )
 
 func init() {
@@ -60,7 +69,11 @@ type MatchFile struct {
 	// directories are treated distinctly, so to match
 	// a directory, the filepath MUST end in a forward
 	// slash `/`. To match a regular file, there must
-	// be no trailing slash. Accepts placeholders.
+	// be no trailing slash. Accepts placeholders. If
+	// the policy is "first_exist", then an error may
+	// be triggered as a fallback by configuring "="
+	// followed by a status code number,
+	// for example "=404".
 	TryFiles []string `json:"try_files,omitempty"`
 
 	// How to choose a file in TryFiles. Can be:
@@ -134,10 +147,119 @@ func (m *MatchFile) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// CELLibrary produces options that expose this matcher for use in CEL
+// expression matchers.
+//
+// Example:
+//    expression file({'root': '/srv', 'try_files': [{http.request.uri.path}, '/index.php'], 'try_policy': 'first_exist', 'split_path': ['.php']})
+func (MatchFile) CELLibrary(ctx caddy.Context) (cel.Library, error) {
+	requestType := decls.NewObjectType("http.Request")
+	envOptions := []cel.EnvOption{
+		cel.Macros(parser.NewGlobalVarArgMacro("file", celFileMatcherMacroExpander())),
+		cel.Declarations(
+			decls.NewFunction("file",
+				decls.NewOverload("file_request_map",
+					[]*exprpb.Type{requestType, caddyhttp.CelTypeJson},
+					decls.Bool,
+				),
+			),
+		),
+	}
+
+	matcherFactory := func(data ref.Val) (caddyhttp.RequestMatcher, error) {
+		values, err := caddyhttp.CELValueToMapStrList(data)
+		if err != nil {
+			return nil, err
+		}
+
+		var root string
+		if len(values["root"]) > 0 {
+			root = values["root"][0]
+		}
+
+		var try_policy string
+		if len(values["try_policy"]) > 0 {
+			root = values["try_policy"][0]
+		}
+
+		m := MatchFile{
+			Root:      root,
+			TryFiles:  values["try_files"],
+			TryPolicy: try_policy,
+			SplitPath: values["split_path"],
+		}
+
+		err = m.Provision(ctx)
+		return m, err
+	}
+
+	programOptions := []cel.ProgramOption{
+		cel.CustomDecorator(caddyhttp.CELMatcherDecorator("file_request_map", matcherFactory)),
+		cel.Functions(
+			&functions.Overload{
+				Operator: "file_request_map",
+				Binary:   caddyhttp.CELMatcherRuntimeFunction("file_request_map", matcherFactory),
+			},
+		),
+	}
+
+	return caddyhttp.NewMatcherCELLibrary(envOptions, programOptions), nil
+}
+
+func celFileMatcherMacroExpander() parser.MacroExpander {
+	return func(eh parser.ExprHelper, target *exprpb.Expr, args []*exprpb.Expr) (*exprpb.Expr, *common.Error) {
+		if len(args) == 0 {
+			return nil, &common.Error{
+				Message: "matcher requires at least one argument",
+			}
+		}
+		if len(args) == 1 {
+			arg := args[0]
+			if isCELStringLiteral(arg) || isCELCaddyPlaceholderCall(arg) {
+				return eh.GlobalCall("file",
+					eh.Ident("request"),
+					eh.NewMap(
+						eh.NewMapEntry(eh.LiteralString("try_files"), eh.NewList(arg)),
+					),
+				), nil
+			}
+			if isCELTryFilesLiteral(arg) {
+				return eh.GlobalCall("file", eh.Ident("request"), arg), nil
+			}
+			return nil, &common.Error{
+				Location: eh.OffsetLocation(arg.GetId()),
+				Message:  "matcher requires either a map or string literal argument",
+			}
+		}
+
+		for _, arg := range args {
+			if !(isCELStringLiteral(arg) || isCELCaddyPlaceholderCall(arg)) {
+				return nil, &common.Error{
+					Location: eh.OffsetLocation(arg.GetId()),
+					Message:  "matcher only supports repeated string literal arguments",
+				}
+			}
+		}
+		return eh.GlobalCall("file",
+			eh.Ident("request"),
+			eh.NewMap(
+				eh.NewMapEntry(
+					eh.LiteralString("try_files"), eh.NewList(args...),
+				),
+			),
+		), nil
+	}
+}
+
 // Provision sets up m's defaults.
 func (m *MatchFile) Provision(_ caddy.Context) error {
 	if m.Root == "" {
 		m.Root = "{http.vars.root}"
+	}
+	// if list of files to try was omitted entirely, assume URL path
+	// (use placeholder instead of r.URL.Path; see issue #4146)
+	if m.TryFiles == nil {
+		m.TryFiles = []string{"{http.request.uri.path}"}
 	}
 	return nil
 }
@@ -174,20 +296,13 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 
 	root := repl.ReplaceAll(m.Root, ".")
 
-	// if list of files to try was omitted entirely,
-	// assume URL path
-	if m.TryFiles == nil {
-		// m is not a pointer, so this is safe
-		m.TryFiles = []string{r.URL.Path}
-	}
-
 	// common preparation of the file into parts
 	prepareFilePath := func(file string) (suffix, fullpath, remainder string) {
 		suffix, remainder = m.firstSplit(path.Clean(repl.ReplaceAll(file, "")))
 		if strings.HasSuffix(file, "/") {
 			suffix += "/"
 		}
-		fullpath = sanitizedPathJoin(root, suffix)
+		fullpath = caddyhttp.SanitizedPathJoin(root, suffix)
 		return
 	}
 
@@ -207,6 +322,10 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 	switch m.TryPolicy {
 	case "", tryPolicyFirstExist:
 		for _, f := range m.TryFiles {
+			if err := parseErrorCode(f); err != nil {
+				caddyhttp.SetVar(r.Context(), caddyhttp.MatcherErrorVarKey, err)
+				return
+			}
 			suffix, fullpath, remainder := prepareFilePath(f)
 			if info, exists := strictFileExists(fullpath); exists {
 				setPlaceholders(info, suffix, fullpath, remainder)
@@ -276,6 +395,20 @@ func (m MatchFile) selectFile(r *http.Request) (matched bool) {
 	return
 }
 
+// parseErrorCode checks if the input is a status
+// code number, prefixed by "=", and returns an
+// error if so.
+func parseErrorCode(input string) error {
+	if len(input) > 1 && input[0] == '=' {
+		code, err := strconv.Atoi(input[1:])
+		if err != nil || code < 100 || code > 999 {
+			return nil
+		}
+		return caddyhttp.Error(code, fmt.Errorf("%s", input[1:]))
+	}
+	return nil
+}
+
 // strictFileExists returns true if file exists
 // and matches the convention of the given file
 // path. If the path ends in a forward slash,
@@ -338,6 +471,107 @@ func indexFold(haystack, needle string) int {
 	return -1
 }
 
+// isCELMapLiteral returns whether the expression resolves to a map literal containing
+// only string keys with or a placeholder call.
+func isCELTryFilesLiteral(e *exprpb.Expr) bool {
+	switch e.GetExprKind().(type) {
+	case *exprpb.Expr_StructExpr:
+		structExpr := e.GetStructExpr()
+		if structExpr.GetMessageName() != "" {
+			return false
+		}
+		for _, entry := range structExpr.GetEntries() {
+			mapKey := entry.GetMapKey()
+			mapVal := entry.GetValue()
+			if !isCELStringLiteral(mapKey) {
+				return false
+			}
+			mapKeyStr := mapKey.GetConstExpr().GetStringValue()
+			if mapKeyStr == "try_files" || mapKeyStr == "split_path" {
+				if !isCELStringListLiteral(mapVal) {
+					return false
+				}
+			} else if mapKeyStr == "try_policy" || mapKeyStr == "root" {
+				if !(isCELStringExpr(mapVal)) {
+					return false
+				}
+			} else {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// isCELStringExpr indicates whether the expression is a supported string expression
+func isCELStringExpr(e *exprpb.Expr) bool {
+	return isCELStringLiteral(e) || isCELCaddyPlaceholderCall(e) || isCELConcatCall(e)
+}
+
+// isCELStringLiteral returns whether the expression is a CEL string literal.
+func isCELStringLiteral(e *exprpb.Expr) bool {
+	switch e.GetExprKind().(type) {
+	case *exprpb.Expr_ConstExpr:
+		constant := e.GetConstExpr()
+		switch constant.GetConstantKind().(type) {
+		case *exprpb.Constant_StringValue:
+			return true
+		}
+	}
+	return false
+}
+
+// isCELCaddyPlaceholderCall returns whether the expression is a caddy placeholder call.
+func isCELCaddyPlaceholderCall(e *exprpb.Expr) bool {
+	switch e.GetExprKind().(type) {
+	case *exprpb.Expr_CallExpr:
+		call := e.GetCallExpr()
+		if call.GetFunction() == "caddyPlaceholder" {
+			return true
+		}
+	}
+	return false
+}
+
+// isCELConcatCall tests whether the expression is a concat function (+) with string, placeholder, or
+// other concat call arguments.
+func isCELConcatCall(e *exprpb.Expr) bool {
+	switch e.GetExprKind().(type) {
+	case *exprpb.Expr_CallExpr:
+		call := e.GetCallExpr()
+		if call.GetTarget() != nil {
+			return false
+		}
+		if call.GetFunction() != operators.Add {
+			return false
+		}
+		for _, arg := range call.GetArgs() {
+			if !isCELStringExpr(arg) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// isCELStringListLiteral returns whether the expression resolves to a list literal
+// containing only string constants or a placeholder call.
+func isCELStringListLiteral(e *exprpb.Expr) bool {
+	switch e.GetExprKind().(type) {
+	case *exprpb.Expr_ListExpr:
+		list := e.GetListExpr()
+		for _, elem := range list.GetElements() {
+			if !isCELStringExpr(elem) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
 const (
 	tryPolicyFirstExist      = "first_exist"
 	tryPolicyLargestSize     = "largest_size"
@@ -347,6 +581,7 @@ const (
 
 // Interface guards
 var (
-	_ caddy.Validator          = (*MatchFile)(nil)
-	_ caddyhttp.RequestMatcher = (*MatchFile)(nil)
+	_ caddy.Validator              = (*MatchFile)(nil)
+	_ caddyhttp.RequestMatcher     = (*MatchFile)(nil)
+	_ caddyhttp.CELLibraryProducer = (*MatchFile)(nil)
 )

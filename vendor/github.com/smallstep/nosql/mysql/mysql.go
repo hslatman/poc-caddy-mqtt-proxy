@@ -1,3 +1,6 @@
+//go:build !nomysql
+// +build !nomysql
+
 package mysql
 
 import (
@@ -51,6 +54,10 @@ func (db *DB) Close() error {
 
 func getQry(bucket []byte) string {
 	return fmt.Sprintf("SELECT nvalue FROM `%s` WHERE nkey = ?", bucket)
+}
+
+func getQryForUpdate(bucket []byte) string {
+	return fmt.Sprintf("SELECT nvalue FROM `%s` WHERE nkey = ? FOR UPDATE", bucket)
 }
 
 func insertUpdateQry(bucket []byte) string {
@@ -148,7 +155,7 @@ func (db *DB) CmpAndSwap(bucket, key, oldValue, newValue []byte) ([]byte, bool, 
 		return nil, false, err
 	case swapped:
 		if err := sqlTx.Commit(); err != nil {
-			return nil, false, errors.Wrapf(err, "failed to commit badger transaction")
+			return nil, false, errors.Wrapf(err, "failed to commit MySQL transaction")
 		}
 		return val, swapped, nil
 	default:
@@ -161,7 +168,7 @@ func (db *DB) CmpAndSwap(bucket, key, oldValue, newValue []byte) ([]byte, bool, 
 
 func cmpAndSwap(sqlTx *sql.Tx, bucket, key, oldValue, newValue []byte) ([]byte, bool, error) {
 	var current []byte
-	err := sqlTx.QueryRow(getQry(bucket), key).Scan(&current)
+	err := sqlTx.QueryRow(getQryForUpdate(bucket), key).Scan(&current)
 
 	if err != nil && err != sql.ErrNoRows {
 		return nil, false, err

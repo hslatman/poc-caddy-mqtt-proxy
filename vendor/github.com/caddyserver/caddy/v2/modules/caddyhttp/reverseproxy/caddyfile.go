@@ -15,10 +15,8 @@
 package reverseproxy
 
 import (
-	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"reflect"
 	"strconv"
 	"strings"
@@ -29,16 +27,23 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/rewrite"
 	"github.com/dustin/go-humanize"
 )
 
 func init() {
 	httpcaddyfile.RegisterHandlerDirective("reverse_proxy", parseCaddyfile)
+	httpcaddyfile.RegisterHandlerDirective("copy_response", parseCopyResponseCaddyfile)
+	httpcaddyfile.RegisterHandlerDirective("copy_response_headers", parseCopyResponseHeadersCaddyfile)
 }
 
 func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	rp := new(Handler)
 	err := rp.UnmarshalCaddyfile(h.Dispenser)
+	if err != nil {
+		return nil, err
+	}
+	err = rp.FinalizeUnmarshalCaddyfile(h)
 	if err != nil {
 		return nil, err
 	}
@@ -48,8 +53,9 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
 //
 //     reverse_proxy [<matcher>] [<upstreams...>] {
-//         # upstreams
-//         to <upstreams...>
+//         # backends
+//         to      <upstreams...>
+//         dynamic <name> [...]
 //
 //         # load balancing
 //         lb_policy <name> [<options...>]
@@ -57,34 +63,58 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 //         lb_try_interval <interval>
 //
 //         # active health checking
-//         health_path <path>
-//         health_port <port>
+//         health_uri      <uri>
+//         health_port     <port>
 //         health_interval <interval>
-//         health_timeout <duration>
-//         health_status <status>
-//         health_body <regexp>
+//         health_timeout  <duration>
+//         health_status   <status>
+//         health_body     <regexp>
 //         health_headers {
 //             <field> [<values...>]
 //         }
 //
 //         # passive health checking
-//         max_fails <num>
-//         fail_duration <duration>
-//         max_conns <num>
-//         unhealthy_status <status>
+//         fail_duration     <duration>
+//         max_fails         <num>
+//         unhealthy_status  <status>
 //         unhealthy_latency <duration>
+//         unhealthy_request_count <num>
 //
 //         # streaming
 //         flush_interval <duration>
 //         buffer_requests
+//         buffer_responses
+//         max_buffer_size <size>
 //
-//         # header manipulation
+//         # request manipulation
+//         trusted_proxies [private_ranges] <ranges...>
 //         header_up   [+|-]<field> [<value|regexp> [<replacement>]]
 //         header_down [+|-]<field> [<value|regexp> [<replacement>]]
+//         method <method>
+//         rewrite <to>
 //
 //         # round trip
 //         transport <name> {
 //             ...
+//         }
+//
+//         # optionally intercept responses from upstream
+//         @name {
+//             status <code...>
+//             header <field> [<value>]
+//         }
+//         replace_status [<matcher>] <status_code>
+//         handle_response [<matcher>] {
+//             <directives...>
+//
+//             # special directives only available in handle_response
+//             copy_response [<matcher>] [<status>] {
+//                 status <status>
+//             }
+//             copy_response_headers [<matcher>] {
+//                 include <fields...>
+//                 exclude <fields...>
+//             }
 //         }
 //     }
 //
@@ -92,6 +122,9 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 // as `host:port`, or a URL such as `scheme://host:port`. Scheme
 // and port may be inferred from other parts of the address/URL; if
 // either are missing, defaults to HTTP.
+//
+// The FinalizeUnmarshalCaddyfile method should be called after this
+// to finalize parsing of "handle_response" blocks, if possible.
 func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// currently, all backends must use the same scheme/protocol (the
 	// underlying JSON does not yet support per-backend transports)
@@ -102,97 +135,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	var transport http.RoundTripper
 	var transportModuleName string
 
-	// TODO: the logic in this function is kind of sensitive, we need
-	// to write tests before making any more changes to it
-	upstreamDialAddress := func(upstreamAddr string) (string, error) {
-		var network, scheme, host, port string
-
-		if strings.Contains(upstreamAddr, "://") {
-			// we get a parsing error if a placeholder is specified
-			// so we return a more user-friendly error message instead
-			// to explain what to do instead
-			if strings.Contains(upstreamAddr, "{") {
-				return "", d.Err("due to parsing difficulties, placeholders are not allowed when an upstream address contains a scheme")
-			}
-
-			toURL, err := url.Parse(upstreamAddr)
-			if err != nil {
-				return "", d.Errf("parsing upstream URL: %v", err)
-			}
-
-			// there is currently no way to perform a URL rewrite between choosing
-			// a backend and proxying to it, so we cannot allow extra components
-			// in backend URLs
-			if toURL.Path != "" || toURL.RawQuery != "" || toURL.Fragment != "" {
-				return "", d.Err("for now, URLs for proxy upstreams only support scheme, host, and port components")
-			}
-
-			// ensure the port and scheme aren't in conflict
-			urlPort := toURL.Port()
-			if toURL.Scheme == "http" && urlPort == "443" {
-				return "", d.Err("upstream address has conflicting scheme (http://) and port (:443, the HTTPS port)")
-			}
-			if toURL.Scheme == "https" && urlPort == "80" {
-				return "", d.Err("upstream address has conflicting scheme (https://) and port (:80, the HTTP port)")
-			}
-			if toURL.Scheme == "h2c" && urlPort == "443" {
-				return "", d.Err("upstream address has conflicting scheme (h2c://) and port (:443, the HTTPS port)")
-			}
-
-			// if port is missing, attempt to infer from scheme
-			if toURL.Port() == "" {
-				var toPort string
-				switch toURL.Scheme {
-				case "", "http", "h2c":
-					toPort = "80"
-				case "https":
-					toPort = "443"
-				}
-				toURL.Host = net.JoinHostPort(toURL.Hostname(), toPort)
-			}
-
-			scheme, host, port = toURL.Scheme, toURL.Hostname(), toURL.Port()
-		} else {
-			// extract network manually, since caddy.ParseNetworkAddress() will always add one
-			if idx := strings.Index(upstreamAddr, "/"); idx >= 0 {
-				network = strings.ToLower(strings.TrimSpace(upstreamAddr[:idx]))
-				upstreamAddr = upstreamAddr[idx+1:]
-			}
-			var err error
-			host, port, err = net.SplitHostPort(upstreamAddr)
-			if err != nil {
-				host = upstreamAddr
-			}
-			// we can assume a port if only a hostname is specified, but use of a
-			// placeholder without a port likely means a port will be filled in
-			if port == "" && !strings.Contains(host, "{") {
-				port = "80"
-			}
-		}
-
-		// the underlying JSON does not yet support different
-		// transports (protocols or schemes) to each backend,
-		// so we remember the last one we see and compare them
-		if commonScheme != "" && scheme != commonScheme {
-			return "", d.Errf("for now, all proxy upstreams must use the same scheme (transport protocol); expecting '%s://' but got '%s://'",
-				commonScheme, scheme)
-		}
-		commonScheme = scheme
-
-		// for simplest possible config, we only need to include
-		// the network portion if the user specified one
-		if network != "" {
-			return caddy.JoinNetworkAddress(network, host, port), nil
-		}
-
-		// if the host is a placeholder, then we don't want to join with an empty port,
-		// because that would just append an extra ':' at the end of the address.
-		if port == "" && strings.Contains(host, "{") {
-			return host, nil
-		}
-
-		return net.JoinHostPort(host, port), nil
-	}
+	// collect the response matchers defined as subdirectives
+	// prefixed with "@" for use with "handle_response" blocks
+	h.responseMatchers = make(map[string]caddyhttp.ResponseMatcher)
 
 	// appendUpstream creates an upstream for address and adds
 	// it to the list. If the address starts with "srv+" it is
@@ -203,10 +148,21 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		if isSRV {
 			address = strings.TrimPrefix(address, "srv+")
 		}
-		dialAddr, err := upstreamDialAddress(address)
+
+		dialAddr, scheme, err := parseUpstreamDialAddress(address)
 		if err != nil {
-			return err
+			return d.WrapErr(err)
 		}
+
+		// the underlying JSON does not yet support different
+		// transports (protocols or schemes) to each backend,
+		// so we remember the last one we see and compare them
+		if commonScheme != "" && scheme != commonScheme {
+			return d.Errf("for now, all proxy upstreams must use the same scheme (transport protocol); expecting '%s://' but got '%s://'",
+				commonScheme, scheme)
+		}
+		commonScheme = scheme
+
 		if isSRV {
 			if host, _, err := net.SplitHostPort(dialAddr); err == nil {
 				dialAddr = host
@@ -227,6 +183,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 
 		for d.NextBlock(0) {
+			// if the subdirective has an "@" prefix then we
+			// parse it as a response matcher for use with "handle_response"
+			if strings.HasPrefix(d.Val(), matcherPrefix) {
+				err := caddyhttp.ParseNamedResponseMatcher(d.NewFromNextSegment(), h.responseMatchers)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+
 			switch d.Val() {
 			case "to":
 				args := d.RemainingArgs()
@@ -239,6 +205,25 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						return err
 					}
 				}
+
+			case "dynamic":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if h.DynamicUpstreams != nil {
+					return d.Err("dynamic upstreams already specified")
+				}
+				dynModule := d.Val()
+				modID := "http.reverse_proxy.upstreams." + dynModule
+				unm, err := caddyfile.UnmarshalModule(d, modID)
+				if err != nil {
+					return err
+				}
+				source, ok := unm.(UpstreamSource)
+				if !ok {
+					return d.Errf("module %s (%T) is not an UpstreamSource", modID, unm)
+				}
+				h.DynamicUpstreamsRaw = caddyconfig.JSONModuleObject(source, "source", dynModule, nil)
 
 			case "lb_policy":
 				if !d.NextArg() {
@@ -331,15 +316,13 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 			case "health_headers":
 				healthHeaders := make(http.Header)
-				for d.Next() {
-					for d.NextBlock(0) {
-						key := d.Val()
-						values := d.RemainingArgs()
-						if len(values) == 0 {
-							values = append(values, "")
-						}
-						healthHeaders[key] = values
+				for nesting := d.Nesting(); d.NextBlock(nesting); {
+					key := d.Val()
+					values := d.RemainingArgs()
+					if len(values) == 0 {
+						values = append(values, "")
 					}
+					healthHeaders[key] = values
 				}
 				if h.HealthChecks == nil {
 					h.HealthChecks = new(HealthChecks)
@@ -538,6 +521,22 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.MaxBufferSize = int64(size)
 
+			case "trusted_proxies":
+				for d.NextArg() {
+					if d.Val() == "private_ranges" {
+						h.TrustedProxies = append(h.TrustedProxies, []string{
+							"192.168.0.0/16",
+							"172.16.0.0/12",
+							"10.0.0.0/8",
+							"127.0.0.1/8",
+							"fd00::/8",
+							"::1",
+						}...)
+						continue
+					}
+					h.TrustedProxies = append(h.TrustedProxies, d.Val())
+				}
+
 			case "header_up":
 				var err error
 
@@ -555,10 +554,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				case 2:
 					// some lint checks, I guess
 					if strings.EqualFold(args[0], "host") && (args[1] == "{hostport}" || args[1] == "{http.request.hostport}") {
-						log.Printf("[WARNING] Unnecessary header_up ('Host' field): the reverse proxy's default behavior is to pass headers to the upstream")
+						caddy.Log().Named("caddyfile").Warn("Unnecessary header_up Host: the reverse proxy's default behavior is to pass headers to the upstream")
+					}
+					if strings.EqualFold(args[0], "x-forwarded-for") && (args[1] == "{remote}" || args[1] == "{http.request.remote}" || args[1] == "{remote_host}" || args[1] == "{http.request.remote.host}") {
+						caddy.Log().Named("caddyfile").Warn("Unnecessary header_up X-Forwarded-For: the reverse proxy's default behavior is to pass headers to the upstream")
 					}
 					if strings.EqualFold(args[0], "x-forwarded-proto") && (args[1] == "{scheme}" || args[1] == "{http.request.scheme}") {
-						log.Printf("[WARNING] Unnecessary header_up ('X-Forwarded-Proto' field): the reverse proxy's default behavior is to pass headers to the upstream")
+						caddy.Log().Named("caddyfile").Warn("Unnecessary header_up X-Forwarded-Proto: the reverse proxy's default behavior is to pass headers to the upstream")
+					}
+					if strings.EqualFold(args[0], "x-forwarded-host") && (args[1] == "{host}" || args[1] == "{http.request.host}" || args[1] == "{hostport}" || args[1] == "{http.request.hostport}") {
+						caddy.Log().Named("caddyfile").Warn("Unnecessary header_up X-Forwarded-Host: the reverse proxy's default behavior is to pass headers to the upstream")
 					}
 					err = headers.CaddyfileHeaderOp(h.Headers.Request, args[0], args[1], "")
 				case 3:
@@ -598,6 +603,30 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Err(err.Error())
 				}
 
+			case "method":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if h.Rewrite == nil {
+					h.Rewrite = &rewrite.Rewrite{}
+				}
+				h.Rewrite.Method = d.Val()
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+
+			case "rewrite":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if h.Rewrite == nil {
+					h.Rewrite = &rewrite.Rewrite{}
+				}
+				h.Rewrite.URI = d.Val()
+				if d.NextArg() {
+					return d.ArgErr()
+				}
+
 			case "transport":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -616,6 +645,44 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("module %s (%T) is not a RoundTripper", modID, unm)
 				}
 				transport = rt
+
+			case "handle_response":
+				// delegate the parsing of handle_response to the caller,
+				// since we need the httpcaddyfile.Helper to parse subroutes.
+				// See h.FinalizeUnmarshalCaddyfile
+				h.handleResponseSegments = append(h.handleResponseSegments, d.NewFromNextSegment())
+
+			case "replace_status":
+				args := d.RemainingArgs()
+				if len(args) != 1 && len(args) != 2 {
+					return d.Errf("must have one or two arguments: an optional response matcher, and a status code")
+				}
+
+				responseHandler := caddyhttp.ResponseHandler{}
+
+				if len(args) == 2 {
+					if !strings.HasPrefix(args[0], matcherPrefix) {
+						return d.Errf("must use a named response matcher, starting with '@'")
+					}
+					foundMatcher, ok := h.responseMatchers[args[0]]
+					if !ok {
+						return d.Errf("no named response matcher defined with name '%s'", args[0][1:])
+					}
+					responseHandler.Match = &foundMatcher
+					responseHandler.StatusCode = caddyhttp.WeakString(args[1])
+				} else if len(args) == 1 {
+					responseHandler.StatusCode = caddyhttp.WeakString(args[0])
+				}
+
+				// make sure there's no block, cause it doesn't make sense
+				if d.NextBlock(1) {
+					return d.Errf("cannot define routes for 'replace_status', use 'handle_response' instead.")
+				}
+
+				h.HandleResponse = append(
+					h.HandleResponse,
+					responseHandler,
+				)
 
 			default:
 				return d.Errf("unrecognized subdirective %s", d.Val())
@@ -659,6 +726,77 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// FinalizeUnmarshalCaddyfile finalizes the Caddyfile parsing which
+// requires having an httpcaddyfile.Helper to function, to parse subroutes.
+func (h *Handler) FinalizeUnmarshalCaddyfile(helper httpcaddyfile.Helper) error {
+	for _, d := range h.handleResponseSegments {
+		// consume the "handle_response" token
+		d.Next()
+		args := d.RemainingArgs()
+
+		// TODO: Remove this check at some point in the future
+		if len(args) == 2 {
+			return d.Errf("configuring 'handle_response' for status code replacement is no longer supported. Use 'replace_status' instead.")
+		}
+
+		if len(args) > 1 {
+			return d.Errf("too many arguments for 'handle_response': %s", args)
+		}
+
+		var matcher *caddyhttp.ResponseMatcher
+		if len(args) == 1 {
+			// the first arg should always be a matcher.
+			if !strings.HasPrefix(args[0], matcherPrefix) {
+				return d.Errf("must use a named response matcher, starting with '@'")
+			}
+
+			foundMatcher, ok := h.responseMatchers[args[0]]
+			if !ok {
+				return d.Errf("no named response matcher defined with name '%s'", args[0][1:])
+			}
+			matcher = &foundMatcher
+		}
+
+		// parse the block as routes
+		handler, err := httpcaddyfile.ParseSegmentAsSubroute(helper.WithDispenser(d.NewFromNextSegment()))
+		if err != nil {
+			return err
+		}
+		subroute, ok := handler.(*caddyhttp.Subroute)
+		if !ok {
+			return helper.Errf("segment was not parsed as a subroute")
+		}
+		h.HandleResponse = append(
+			h.HandleResponse,
+			caddyhttp.ResponseHandler{
+				Match:  matcher,
+				Routes: subroute.Routes,
+			},
+		)
+	}
+
+	// move the handle_response entries without a matcher to the end.
+	// we can't use sort.SliceStable because it will reorder the rest of the
+	// entries which may be undesirable because we don't have a good
+	// heuristic to use for sorting.
+	withoutMatchers := []caddyhttp.ResponseHandler{}
+	withMatchers := []caddyhttp.ResponseHandler{}
+	for _, hr := range h.HandleResponse {
+		if hr.Match == nil {
+			withoutMatchers = append(withoutMatchers, hr)
+		} else {
+			withMatchers = append(withMatchers, hr)
+		}
+	}
+	h.HandleResponse = append(withMatchers, withoutMatchers...)
+
+	// clean up the bits we only needed for adapting
+	h.handleResponseSegments = nil
+	h.responseMatchers = nil
+
+	return nil
+}
+
 // UnmarshalCaddyfile deserializes Caddyfile tokens into h.
 //
 //     transport http {
@@ -669,14 +807,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 //         dial_fallback_delay     <duration>
 //         response_header_timeout <duration>
 //         expect_continue_timeout <duration>
+//         resolvers               <resolvers...>
 //         tls
 //         tls_client_auth <automate_name> | <cert_file> <key_file>
 //         tls_insecure_skip_verify
 //         tls_timeout <duration>
 //         tls_trusted_ca_certs <cert_files...>
 //         tls_server_name <sni>
+//         tls_renegotiation <level>
+//         tls_except_ports <ports...>
 //         keepalive [off|<duration>]
+//         keepalive_interval <interval>
 //         keepalive_idle_conns <max_count>
+//         keepalive_idle_conns_per_host <count>
 //         versions <versions...>
 //         compression off
 //         max_conns_per_host <count>
@@ -757,6 +900,20 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.ExpectContinueTimeout = caddy.Duration(dur)
 
+			case "resolvers":
+				if h.Resolver == nil {
+					h.Resolver = new(UpstreamResolver)
+				}
+				h.Resolver.Addresses = d.RemainingArgs()
+				if len(h.Resolver.Addresses) == 0 {
+					return d.Errf("must specify at least one resolver address")
+				}
+
+			case "tls":
+				if h.TLS == nil {
+					h.TLS = new(TLSConfig)
+				}
+
 			case "tls_client_auth":
 				if h.TLS == nil {
 					h.TLS = new(TLSConfig)
@@ -770,11 +927,6 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					h.TLS.ClientCertificateKeyFile = args[1]
 				default:
 					return d.ArgErr()
-				}
-
-			case "tls":
-				if h.TLS == nil {
-					h.TLS = new(TLSConfig)
 				}
 
 			case "tls_insecure_skip_verify":
@@ -818,6 +970,29 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.TLS.ServerName = d.Val()
 
+			case "tls_renegotiation":
+				if h.TLS == nil {
+					h.TLS = new(TLSConfig)
+				}
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				switch renegotiation := d.Val(); renegotiation {
+				case "never", "once", "freely":
+					h.TLS.Renegotiation = renegotiation
+				default:
+					return d.ArgErr()
+				}
+
+			case "tls_except_ports":
+				if h.TLS == nil {
+					h.TLS = new(TLSConfig)
+				}
+				h.TLS.ExceptPorts = d.RemainingArgs()
+				if len(h.TLS.ExceptPorts) == 0 {
+					return d.ArgErr()
+				}
+
 			case "keepalive":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -836,6 +1011,19 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.KeepAlive.IdleConnTimeout = caddy.Duration(dur)
 
+			case "keepalive_interval":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad interval value '%s': %v", d.Val(), err)
+				}
+				if h.KeepAlive == nil {
+					h.KeepAlive = new(KeepAlive)
+				}
+				h.KeepAlive.ProbeInterval = caddy.Duration(dur)
+
 			case "keepalive_idle_conns":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -848,6 +1036,18 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					h.KeepAlive = new(KeepAlive)
 				}
 				h.KeepAlive.MaxIdleConns = num
+
+			case "keepalive_idle_conns_per_host":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				num, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return d.Errf("bad integer value '%s': %v", d.Val(), err)
+				}
+				if h.KeepAlive == nil {
+					h.KeepAlive = new(KeepAlive)
+				}
 				h.KeepAlive.MaxIdleConnsPerHost = num
 
 			case "versions":
@@ -874,16 +1074,6 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				h.MaxConnsPerHost = num
 
-			case "max_idle_conns_per_host":
-				if !d.NextArg() {
-					return d.ArgErr()
-				}
-				num, err := strconv.Atoi(d.Val())
-				if err != nil {
-					return d.Errf("bad integer value '%s': %v", d.Val(), err)
-				}
-				h.MaxIdleConnsPerHost = num
-
 			default:
 				return d.Errf("unrecognized subdirective %s", d.Val())
 			}
@@ -892,8 +1082,280 @@ func (h *HTTPTransport) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+func parseCopyResponseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	crh := new(CopyResponseHandler)
+	err := crh.UnmarshalCaddyfile(h.Dispenser)
+	if err != nil {
+		return nil, err
+	}
+	return crh, nil
+}
+
+// UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
+//
+//    copy_response [<matcher>] [<status>] {
+//        status <status>
+//    }
+//
+func (h *CopyResponseHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		args := d.RemainingArgs()
+		if len(args) == 1 {
+			if num, err := strconv.Atoi(args[0]); err == nil && num > 0 {
+				h.StatusCode = caddyhttp.WeakString(args[0])
+				break
+			}
+		}
+
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "status":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				h.StatusCode = caddyhttp.WeakString(d.Val())
+			default:
+				return d.Errf("unrecognized subdirective '%s'", d.Val())
+			}
+		}
+	}
+	return nil
+}
+
+func parseCopyResponseHeadersCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	crh := new(CopyResponseHeadersHandler)
+	err := crh.UnmarshalCaddyfile(h.Dispenser)
+	if err != nil {
+		return nil, err
+	}
+	return crh, nil
+}
+
+// UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
+//
+//    copy_response_headers [<matcher>] {
+//        include <fields...>
+//        exclude <fields...>
+//    }
+//
+func (h *CopyResponseHeadersHandler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		args := d.RemainingArgs()
+		if len(args) > 0 {
+			return d.ArgErr()
+		}
+
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "include":
+				h.Include = append(h.Include, d.RemainingArgs()...)
+
+			case "exclude":
+				h.Exclude = append(h.Exclude, d.RemainingArgs()...)
+
+			default:
+				return d.Errf("unrecognized subdirective '%s'", d.Val())
+			}
+		}
+	}
+	return nil
+}
+
+// UnmarshalCaddyfile deserializes Caddyfile tokens into h.
+//
+//     dynamic srv [<name>] {
+//         service             <service>
+//         proto               <proto>
+//         name                <name>
+//         refresh             <interval>
+//         resolvers           <resolvers...>
+//         dial_timeout        <timeout>
+//         dial_fallback_delay <timeout>
+//     }
+//
+func (u *SRVUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		args := d.RemainingArgs()
+		if len(args) > 1 {
+			return d.ArgErr()
+		}
+		if len(args) > 0 {
+			u.Name = args[0]
+		}
+
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "service":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if u.Service != "" {
+					return d.Errf("srv service has already been specified")
+				}
+				u.Service = d.Val()
+
+			case "proto":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if u.Proto != "" {
+					return d.Errf("srv proto has already been specified")
+				}
+				u.Proto = d.Val()
+
+			case "name":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if u.Name != "" {
+					return d.Errf("srv name has already been specified")
+				}
+				u.Name = d.Val()
+
+			case "refresh":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("parsing refresh interval duration: %v", err)
+				}
+				u.Refresh = caddy.Duration(dur)
+
+			case "resolvers":
+				if u.Resolver == nil {
+					u.Resolver = new(UpstreamResolver)
+				}
+				u.Resolver.Addresses = d.RemainingArgs()
+				if len(u.Resolver.Addresses) == 0 {
+					return d.Errf("must specify at least one resolver address")
+				}
+
+			case "dial_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+				}
+				u.DialTimeout = caddy.Duration(dur)
+
+			case "dial_fallback_delay":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad delay value '%s': %v", d.Val(), err)
+				}
+				u.FallbackDelay = caddy.Duration(dur)
+
+			default:
+				return d.Errf("unrecognized srv option '%s'", d.Val())
+			}
+		}
+	}
+
+	return nil
+}
+
+// UnmarshalCaddyfile deserializes Caddyfile tokens into h.
+//
+//     dynamic a [<name> <port] {
+//         name                <name>
+//         port                <port>
+//         refresh             <interval>
+//         resolvers           <resolvers...>
+//         dial_timeout        <timeout>
+//         dial_fallback_delay <timeout>
+//     }
+//
+func (u *AUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		args := d.RemainingArgs()
+		if len(args) > 2 {
+			return d.ArgErr()
+		}
+		if len(args) > 0 {
+			u.Name = args[0]
+			u.Port = args[1]
+		}
+
+		for d.NextBlock(0) {
+			switch d.Val() {
+			case "name":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if u.Name != "" {
+					return d.Errf("a name has already been specified")
+				}
+				u.Name = d.Val()
+
+			case "port":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				if u.Port != "" {
+					return d.Errf("a port has already been specified")
+				}
+				u.Port = d.Val()
+
+			case "refresh":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("parsing refresh interval duration: %v", err)
+				}
+				u.Refresh = caddy.Duration(dur)
+
+			case "resolvers":
+				if u.Resolver == nil {
+					u.Resolver = new(UpstreamResolver)
+				}
+				u.Resolver.Addresses = d.RemainingArgs()
+				if len(u.Resolver.Addresses) == 0 {
+					return d.Errf("must specify at least one resolver address")
+				}
+
+			case "dial_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad timeout value '%s': %v", d.Val(), err)
+				}
+				u.DialTimeout = caddy.Duration(dur)
+
+			case "dial_fallback_delay":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("bad delay value '%s': %v", d.Val(), err)
+				}
+				u.FallbackDelay = caddy.Duration(dur)
+
+			default:
+				return d.Errf("unrecognized srv option '%s'", d.Val())
+			}
+		}
+	}
+
+	return nil
+}
+
+const matcherPrefix = "@"
+
 // Interface guards
 var (
 	_ caddyfile.Unmarshaler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler = (*HTTPTransport)(nil)
+	_ caddyfile.Unmarshaler = (*SRVUpstreams)(nil)
+	_ caddyfile.Unmarshaler = (*AUpstreams)(nil)
 )
